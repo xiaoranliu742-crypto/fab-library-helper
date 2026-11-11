@@ -42,10 +42,11 @@
     <p class="message" id="message" role="status" aria-live="polite">正在扫描当前网页…</p>
     <div class="settings"><label class="field">领取授权<select id="license"><option value="auto">自动 · 只选零元授权</option><option value="professional">Professional · 专业</option><option value="personal">Personal · 个人</option></select></label>
     <label class="field">领取后间隔<select id="delay"><option value="500">0.5 秒 · 快速</option><option value="1000">1 秒</option><option value="2000">2 秒</option><option value="4000">4 秒</option><option value="8000">8 秒</option></select></label></div>
+    <label class="field">同时处理<select id="concurrency"><option value="3">3 项 · 并发快速</option><option value="1">1 项 · 串行</option></select></label>
     <label class="check"><input type="checkbox" id="scroll">自动向下滚动，继续处理新加载的素材</label>
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span>by jushan · v1.1.1</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span>by jushan · v1.2.0</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -55,7 +56,8 @@
   const labels = { pending: '待核对', processing: '核对中', claimed: '已入库', owned: '已拥有', skipped: '已跳过', failed: '失败' };
   const marks = { pending: '·', processing: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const client = new Core.Client({ fetch: window.fetch.bind(window), cookie: () => document.cookie });
+  const client = new Core.Client({ fetch: window.fetch.bind(window), cookie: () => document.cookie,
+    onHalt: e => { stopRequested = true; setMessage(e.message, true); } });
   const escape = text => String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
   function render() {
@@ -65,7 +67,8 @@
     const done = Object.values(counts).reduce((a, b) => a + b, 0);
     for (const key of Object.keys(counts)) $('#' + key).textContent = counts[key];
     $('#counter').textContent = done + '/' + all.length;
-    $('#summary').textContent = running ? (stopRequested ? '正在暂停 · 等待当前结果' : '正在入库 · ' + counts.claimed + ' 项成功') : 'Fab 助手 · ' + (done ? '已入库 ' + counts.claimed + ' 项' : '发现 ' + all.length + ' 项素材');
+    const active = all.filter(i => i.status === 'processing').length;
+    $('#summary').textContent = running ? (stopRequested ? '正在暂停 · 等待当前结果' : '正在入库 · ' + active + ' 项处理中 · ' + counts.claimed + ' 项成功') : 'Fab 助手 · ' + (done ? '已入库 ' + counts.claimed + ' 项' : '发现 ' + all.length + ' 项素材');
     $('#message').textContent = message;
     $('#message').classList.toggle('error', error);
     $('.dot').classList.toggle('warn', error);
@@ -78,7 +81,7 @@
     $('#scan').disabled = running;
     $('#retry').disabled = running || !counts.failed;
     $('#export').disabled = !all.length;
-    for (const el of [$('#license'), $('#delay'), $('#scroll')]) el.disabled = running;
+    for (const el of [$('#license'), $('#delay'), $('#concurrency'), $('#scroll')]) el.disabled = running;
     $('#found').textContent = '当前网页 · ' + all.length + ' 项';
     const visible = all.filter(i => i.status === 'processing').concat(all.filter(i => i.status !== 'processing').slice(-60));
     $('#list').innerHTML = visible.length ? visible.map(i => `<div class="row"><span class="mark ${i.status === 'claimed' ? 'green' : ''}">${marks[i.status]}</span><div class="meta"><a class="name" href="${escape(i.href)}" target="_blank" rel="noopener noreferrer" title="${escape(i.name)}">${escape(i.name)}</a><div class="note">${escape(i.note || (i.hint === 'free' ? '网页标记免费 · 入库前再次核对价格' : i.hint === 'owned' ? '网页标记已拥有 · 将核对账号状态' : '将核对价格与拥有状态'))}</div></div><span class="state">${labels[i.status]}</span></div>`).join('') : '<div class="empty">当前页面尚未发现素材卡片。<br>请打开卖家页或搜索结果，等待加载后重新扫描。</div>';
@@ -107,9 +110,28 @@
     if (running) return;
     running = true; stopRequested = false;
     const preference = $('#license').value, delay = Number($('#delay').value), autoScroll = $('#scroll').checked;
+    const concurrency = $('#concurrency').value === '3' ? 3 : 1;
     let emptyRounds = 0;
     discover();
-    setMessage('开始核对当前网页的素材…');
+    setMessage(`开始核对当前网页的素材 · 最多同时处理 ${concurrency} 项…`);
+    async function worker() {
+      while (!shouldStop()) {
+        // Reserve synchronously before the first await so workers never claim the same item.
+        const item = [...items.values()].find(i => i.status === 'pending');
+        if (!item) return;
+        item.status = 'processing'; item.note = '';
+        if (!error) setMessage(`最多同时处理 ${concurrency} 项 · 正在核对：` + item.name);
+        try {
+          Object.assign(item, await client.claim(item, preference, shouldStop));
+        } catch (e) {
+          if (e instanceof Core.Paused) { item.status = 'pending'; render(); return; }
+          item.status = 'failed'; item.note = e.message;
+          if (e.halt) { stopRequested = true; setMessage(e.message, true); }
+        }
+        render();
+        await waitInterruptibly(['owned', 'skipped'].includes(item.status) ? Math.min(delay, 100) : delay);
+      }
+    }
     try {
       while (!shouldStop()) {
         let item = [...items.values()].find(i => i.status === 'pending');
@@ -125,20 +147,12 @@
           continue;
         }
         emptyRounds = 0;
-        item.status = 'processing'; item.note = '';
-        setMessage('正在核对：' + item.name);
-        try {
-          Object.assign(item, await client.claim(item, preference, shouldStop));
-        } catch (e) {
-          if (e instanceof Core.Paused) { item.status = 'pending'; break; }
-          item.status = 'failed'; item.note = e.message;
-          if (e.halt) { stopRequested = true; setMessage(e.message, true); }
-        }
-        render();
-        // No claim was submitted for owned/paid items; don't add the full claim cooldown.
-        await waitInterruptibly(['owned', 'skipped'].includes(item.status) ? Math.min(delay, 100) : delay);
+        // Drain all workers before scrolling, finishing or starting a new batch.
+        const workers = await Promise.allSettled(Array.from({ length: concurrency }, () => worker()));
+        const failure = workers.find(result => result.status === 'rejected');
+        if (failure) throw failure.reason;
       }
-      if (!error) setMessage(shouldStop() ? '已暂停。已提交的项目会完成状态核对，之后不再领取下一项。' : autoScroll ? '本轮已完成：连续多次滚动未发现新素材。可继续滚动后重新扫描。' : '当前已加载素材处理完成。向下滚动后可重新扫描，或开启自动滚动。');
+      if (!error) setMessage(shouldStop() ? '已暂停。已提交的项目已完成状态核对，之后不再领取新项目。' : autoScroll ? '本轮已完成：连续多次滚动未发现新素材。可继续滚动后重新扫描。' : '当前已加载素材处理完成。向下滚动后可重新扫描，或开启自动滚动。');
     } catch (e) { setMessage('任务已停止：' + e.message, true); }
     finally {
       running = false;
@@ -152,7 +166,7 @@
   ui.addEventListener('keydown', e => { if (e.key === 'Escape') open(false); });
   $('#scan').addEventListener('click', () => discover(true));
   $('#start').addEventListener('click', run);
-  $('#pause').addEventListener('click', () => { stopRequested = true; setMessage('正在暂停，等待当前项目的状态核对完成…'); });
+  $('#pause').addEventListener('click', () => { stopRequested = true; setMessage('正在暂停，等待已提交项目的状态核对完成…'); });
   $('#retry').addEventListener('click', () => { for (const item of items.values()) if (item.status === 'failed') { item.status = 'pending'; item.note = ''; } run(); });
   $('#export').addEventListener('click', () => {
     const data = { exportedAt: new Date().toISOString(), page: location.origin + location.pathname,
@@ -162,15 +176,16 @@
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   });
   async function saveSettings() {
-    try { await chrome.storage.local.set({ fabHelperSettings: { license: $('#license').value, delay: $('#delay').value, scroll: $('#scroll').checked } }); }
+    try { await chrome.storage.local.set({ fabHelperSettings: { license: $('#license').value, delay: $('#delay').value, concurrency: $('#concurrency').value, scroll: $('#scroll').checked } }); }
     catch { setMessage('扩展设置未能保存。如刚更新扩展，请刷新网页。', true); }
   }
-  for (const id of ['license', 'delay', 'scroll']) $('#' + id).addEventListener('change', saveSettings);
+  for (const id of ['license', 'delay', 'concurrency', 'scroll']) $('#' + id).addEventListener('change', saveSettings);
   try {
     const { fabHelperSettings: saved } = await chrome.storage.local.get('fabHelperSettings');
     if (saved) {
       if (['auto', 'professional', 'personal'].includes(saved.license)) $('#license').value = saved.license;
       if (['500', '1000', '2000', '4000', '8000'].includes(String(saved.delay))) $('#delay').value = String(saved.delay);
+      if (['1', '3'].includes(String(saved.concurrency))) $('#concurrency').value = String(saved.concurrency);
       $('#scroll').checked = saved.scroll === true;
     }
   } catch { /* Defaults work even if local settings are unavailable. */ }

@@ -77,8 +77,8 @@
   }
 
   class Client {
-    constructor({ fetch, cookie = () => '', sleep = ms => new Promise(r => setTimeout(r, ms)) }) {
-      this.fetch = fetch; this.cookie = cookie; this.sleep = sleep;
+    constructor({ fetch, cookie = () => '', sleep = ms => new Promise(r => setTimeout(r, ms)), onHalt = () => {} }) {
+      this.fetch = fetch; this.cookie = cookie; this.sleep = sleep; this.onHalt = onHalt;
     }
     async request(path, method = 'GET', payload) {
       // No arbitrary URLs, payment endpoints, auth tokens or cross-origin requests.
@@ -87,7 +87,11 @@
       const headers = { Accept: 'application/json' };
       if (method === 'POST') {
         const token = this.cookie().match(/(?:^|;\s*)fab_csrftoken=([^;]+)/)?.[1];
-        if (!token) throw new ApiError('缺少网页验证信息。请在 Fab 手动领取一项免费素材并完成授权后重试', 403);
+        if (!token) {
+          const error = new ApiError('缺少网页验证信息。请在 Fab 手动领取一项免费素材并完成授权后重试', 403);
+          this.onHalt(error);
+          throw error;
+        }
         headers['X-CSRFToken'] = token;
         headers['Content-Type'] = 'application/json';
       }
@@ -106,7 +110,10 @@
         if (!body.trim()) return null;
         try { return JSON.parse(body); } catch { throw new ApiError('Fab 返回了非 JSON 页面，可能需要重新登录或完成网页验证', 403); }
       } catch (error) {
-        if (error instanceof ApiError) throw error;
+        if (error instanceof ApiError) {
+          if (error.halt) this.onHalt(error);
+          throw error;
+        }
         throw new ApiError(error.name === 'AbortError' ? '请求超时；如已提交入库，重试时会先核对拥有状态' : '网络请求失败，请检查网络或网页验证状态');
       } finally { clearTimeout(timeout); }
     }
@@ -126,9 +133,9 @@
         this.request('/i/listings/' + item.id),
         this.request('/i/listings/' + item.id + '/prices-infos')
       ]);
-      checkpoint();
       const failure = reads.find(r => r.status === 'rejected' && r.reason?.halt) || reads.find(r => r.status === 'rejected');
       if (failure) throw failure.reason;
+      checkpoint();
       const [detail, prices] = reads.map(r => r.value);
       if (typeof detail?.title === 'string') item.name = detail.title.slice(0, 240);
       const offer = selectOffer(detail, prices, preferred);

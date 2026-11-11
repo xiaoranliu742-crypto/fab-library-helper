@@ -196,6 +196,10 @@ async function uiFixture(t, options = {}) {
   w.chrome = { runtime: { id: 'local-test', onMessage: { addListener() {} } }, storage: { local: { get: async () => options.settings ? { fabHelperSettings: options.settings } : {}, set: async () => {} } } };
   w.fetch = async (url, init) => {
     calls.push({ url, init });
+    if (options.fetch) {
+      if (init.method === 'POST') posts++;
+      return options.fetch(url, init);
+    }
     if (options.stateBarrier && url.includes('listings-states') && !posts) await options.stateBarrier;
     if (init.method === 'POST') { posts++; return response(null, 204); }
     if (url.includes('listings-states')) return response({ acquired: options.owned === true || posts > 0 });
@@ -225,9 +229,116 @@ test('webpage panel mounts, counts From Free and never auto-claims on load', asy
 });
 
 test('speed upgrade preserves an existing user-selected interval', async t => {
-  const h = await uiFixture(t, { settings: { delay: '2000', license: 'personal', scroll: false } });
+  const h = await uiFixture(t, { settings: { delay: '2000', license: 'personal', concurrency: '1', scroll: false } });
   assert.equal(h.shadow.querySelector('#delay').value, '2000');
   assert.equal(h.shadow.querySelector('#license').value, 'personal');
+  assert.equal(h.shadow.querySelector('#concurrency').value, '1');
+});
+
+const assetGrid = ids => '<main><section>' + ids.map(id => `<article><a href="/listings/${id}">Asset ${id}</a><p>From Free</p></article>`).join('') + '</section></main>';
+async function until(predicate, message) {
+  const deadline = Date.now() + 3000;
+  while (!predicate() && Date.now() < deadline) await tick();
+  assert.ok(predicate(), message);
+}
+
+test('quick mode reserves exactly three assets concurrently and never duplicates a claim', async t => {
+  const ids = [A, B, C, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 'ffffffff-ffff-4fff-8fff-ffffffffffff'];
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const acquired = new Set(), posted = [];
+  const h = await uiFixture(t, { html: assetGrid(ids), fetch: async (url, init) => {
+    const id = url.match(/[a-f0-9-]{36}/)[0];
+    if (url.includes('listings-states')) {
+      if (!acquired.has(id)) await barrier;
+      return response({ acquired: acquired.has(id) });
+    }
+    if (init.method === 'POST') { posted.push(id); acquired.add(id); return response(null, 204); }
+    return response(url.endsWith('/prices-infos') ? zero : detail);
+  } });
+  assert.equal(h.shadow.querySelector('#concurrency').value, '3');
+  h.shadow.querySelector('#start').click();
+  try {
+    await until(() => h.calls.length === 3, 'three ownership reads should overlap');
+    assert.equal(h.shadow.querySelectorAll('.state').length, 6);
+    assert.equal([...h.shadow.querySelectorAll('.state')].filter(e => e.textContent === '核对中').length, 3);
+    assert.equal(h.posts, 0);
+    assert.equal(h.shadow.querySelector('#concurrency').disabled, true);
+  } finally { release(); }
+  await until(() => h.shadow.querySelector('#pause').disabled, 'all workers should finish');
+  assert.equal(h.shadow.querySelector('#claimed').textContent, '6');
+  assert.deepEqual(posted.slice().sort(), ids.slice().sort());
+  assert.equal(h.scans, 3);
+});
+
+test('serial option and pause prevent reserving another asset while a read is in flight', async t => {
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const h = await uiFixture(t, { html: assetGrid([A, B, C]), stateBarrier: barrier, settings: { concurrency: '1' } });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.calls.length === 1, 'only one read starts in serial mode');
+  h.shadow.querySelector('#pause').click();
+  release();
+  await until(() => h.shadow.querySelector('#start').disabled === false, 'paused work returns to pending');
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.posts, 0);
+});
+
+test('a rate limit stops other workers before POST and drains their outstanding reads', async t => {
+  let releaseOther, releaseLimited;
+  const other = new Promise(resolve => { releaseOther = resolve; });
+  const limited = new Promise(resolve => { releaseLimited = resolve; });
+  const h = await uiFixture(t, { html: assetGrid([A, B, C]), fetch: async (url, init) => {
+    if (url.includes('listings-states')) return response({ acquired: false });
+    if (init.method === 'POST') return response(null, 204);
+    if (url.includes(A) && url.endsWith('/prices-infos')) { await limited; return response({}, 429); }
+    if (!url.includes(A)) await other;
+    return response(url.endsWith('/prices-infos') ? zero : detail);
+  } });
+  h.shadow.querySelector('#start').click();
+  try {
+    await until(() => h.calls.length === 9, 'all three preflights should start');
+    releaseLimited();
+    await until(() => /限流/.test(h.shadow.querySelector('#message').textContent), 'rate limit must be reported immediately');
+    assert.equal(h.shadow.querySelector('#start').disabled, true);
+    assert.equal(h.shadow.querySelector('#concurrency').disabled, true);
+    assert.equal(h.posts, 0);
+  } finally { releaseLimited(); releaseOther(); }
+  await until(() => h.shadow.querySelector('#concurrency').disabled === false, 'all outstanding reads must settle');
+  assert.equal(h.posts, 0);
+  assert.equal(h.shadow.querySelector('#failed').textContent, '1');
+  assert.equal(h.shadow.querySelectorAll('.state').length, 3);
+  assert.equal([...h.shadow.querySelectorAll('.state')].filter(e => e.textContent === '待核对').length, 2);
+});
+
+test('pause waits for submitted claims to verify while stopping unsubmitted workers', async t => {
+  let releaseVerify, releaseOther;
+  const verify = new Promise(resolve => { releaseVerify = resolve; });
+  const other = new Promise(resolve => { releaseOther = resolve; });
+  let submitted = false;
+  const h = await uiFixture(t, { html: assetGrid([A, B, C]), fetch: async (url, init) => {
+    if (url.includes('listings-states')) {
+      if (!url.includes(A)) { await other; return response({ acquired: false }); }
+      if (submitted) await verify;
+      return response({ acquired: submitted });
+    }
+    if (init.method === 'POST') { submitted = true; return response(null, 204); }
+    return response(url.endsWith('/prices-infos') ? zero : detail);
+  } });
+  h.shadow.querySelector('#start').click();
+  try {
+    await until(() => h.posts === 1, 'first asset must be submitted');
+    h.shadow.querySelector('#pause').click();
+    assert.equal(h.shadow.querySelector('#claimed').textContent, '0');
+    assert.equal(h.shadow.querySelector('#concurrency').disabled, true);
+    releaseOther();
+    await tick();
+    assert.equal(h.posts, 1);
+    assert.equal(h.shadow.querySelector('#concurrency').disabled, true);
+  } finally { releaseOther(); releaseVerify(); }
+  await until(() => h.shadow.querySelector('#concurrency').disabled === false, 'submitted ownership verification should finish');
+  assert.equal(h.shadow.querySelector('#claimed').textContent, '1');
+  assert.equal(h.posts, 1);
 });
 
 test('known owned queue drains without per-item page scans or a full claim cooldown', async t => {
