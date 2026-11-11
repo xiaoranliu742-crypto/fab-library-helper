@@ -1440,3 +1440,90 @@ test('malformed confirmation batches safely fall back to individual state reads'
   assert.equal(h.shadow.querySelector('#claimed').textContent,'2');
   assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,2);
 });
+
+
+test('fast request intervals and zero item delay are selectable and persist across reload', async t => {
+  for(const rate of ['100','250']){
+    const storage={};
+    const h=await uiFixture(t,{storage,settings:{rate,delay:'0',concurrency:'16'}});
+    assert.equal(h.shadow.querySelector('#rate').value,rate);
+    assert.equal(h.shadow.querySelector('#delay').value,'0');
+    h.shadow.querySelector('#rate').dispatchEvent(new h.w.Event('change'));
+    await tick();
+    const next=await uiFixture(t,{storage});
+    assert.equal(next.shadow.querySelector('#rate').value,rate);
+    assert.equal(next.shadow.querySelector('#delay').value,'0');
+    assert.equal(h.posts,0);
+    assert.equal(h.identityCalls,0);
+  }
+});
+
+test('one-click turbo applies a concrete faster configuration without starting or clearing progress', async t => {
+  const owned='fabHelperOwned_v1_fixture-account_'+A,checkpoint=catalogRecord('fixture-account');
+  const storage={[owned]:{version:1,status:'owned'},[checkpoint]:{version:2,sort:'title',cursor:'saved',pages:12,done:false}};
+  const h=await uiFixture(t,{storage,settings:{rate:'500',delay:'2000',concurrency:'8'}});
+  const before=JSON.stringify({owned:storage[owned],checkpoint:storage[checkpoint]});
+  const turbo=h.shadow.querySelector('#turbo');assert.ok(turbo);
+  turbo.click();await tick();
+  assert.equal(h.shadow.querySelector('#rate').value,'100');
+  assert.equal(h.shadow.querySelector('#delay').value,'0');
+  assert.equal(h.shadow.querySelector('#concurrency').value,'16');
+  assert.equal(storage.fabHelperSettings.rate,'100');
+  assert.equal(storage.fabHelperSettings.delay,'0');
+  assert.equal(storage.fabHelperSettings.concurrency,'16');
+  assert.equal(JSON.stringify({owned:storage[owned],checkpoint:storage[checkpoint]}),before);
+  assert.equal(h.posts,0);assert.equal(h.identityCalls,0);
+});
+
+test('turbo never clears an active server cooldown or dispatches a request during it', async t => {
+  const cooldown={version:1,until:Date.now()+60000};
+  const h=await uiFixture(t,{storage:{fabHelperRateLimit_v1:cooldown},settings:{scope:'quixel'}});
+  const turbo=h.shadow.querySelector('#turbo');assert.ok(turbo);turbo.click();await tick();
+  assert.deepEqual(h.storage.fabHelperRateLimit_v1,cooldown);
+  assert.equal(h.shadow.querySelector('#start').disabled,true);
+  assert.equal(h.calls.length,0);assert.equal(h.identityCalls,0);
+});
+
+test('fast modes back off only to valid interval options and keep 429 cooldown protection', async t => {
+  for(const [before,after] of [['100','250'],['250','500'],['500','1000'],['1000','2000'],['2000','2000']]){
+    const h=await uiFixture(t,{settings:{rate:before},fetch:async()=>response({},429)});
+    h.shadow.querySelector('#start').click();
+    await until(()=>!h.shadow.querySelector('#scope').disabled,'fast rate limit should drain');
+    assert.equal(h.shadow.querySelector('#rate').value,after);
+    assert.equal(h.storage.fabHelperSettings.rate,after);
+    assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
+    assert.equal(h.shadow.querySelector('#start').disabled,true);
+    assert.equal(h.posts,0);
+  }
+});
+
+test('100 ms mode preserves request spacing while reducing the same 51-request scheduling budget fivefold', async () => {
+  const elapsed=[];
+  for(const interval of [500,100]){
+    let now=0;const starts=[];
+    const gate=new Core.RequestGate({interval,now:()=>now,sleep:ms=>new Promise(resolve=>setImmediate(()=>{now+=ms;resolve();}))});
+    const client=new Core.Client({beforeRequest:()=>gate.wait(),fetch:async()=>{starts.push(now);return response({});}});
+    await Promise.all(Array.from({length:51},()=>client.request('/i/users/me')));
+    assert.equal(starts.length,51);
+    for(let i=1;i<starts.length;i++)assert.ok(starts[i]-starts[i-1]>=interval);
+    elapsed.push(starts.at(-1)-starts[0]);
+  }
+  assert.deepEqual(elapsed,[25000,5000]);
+});
+
+test('cached catalogue pages have no fixed half-second delay beyond the global request gate', async t => {
+  const storage={};for(const id of [A,B,C])storage['fabHelperOwned_v1_fixture-account_'+id]={version:1,status:'owned'};
+  const starts=[];
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel',rate:'100',delay:'0'},fetch:async url=>{
+    assert.ok(url.includes('/listings/search?'));
+    starts.push(Date.now());
+    const cursor=searchUrl(url).searchParams.get('cursor');
+    return response(cursor==='third'?catalogPage([C]):cursor==='second'?catalogPage([B],'third'):catalogPage([A],'second'));
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'cached scan should drain without extra page sleeps');
+  assert.equal(starts.length,3);
+  for(let i=1;i<starts.length;i++)assert.ok(starts[i]-starts[i-1]<450,'the gate already provides request pacing');
+  assert.equal(h.posts,0);
+  assert.equal(h.storage[catalogRecord('fixture-account')].pages,3);
+});

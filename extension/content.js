@@ -42,15 +42,15 @@
     <p class="message" id="message" role="status" aria-live="polite">正在扫描当前网页…</p>
     <label class="field" style="margin-bottom:12px">处理范围<select id="scope"><option value="page">当前网页 · 扫描卡片</option><option value="quixel">Quixel 全库 · 低内存</option></select></label>
     <div class="settings"><label class="field">领取授权<select id="license"><option value="auto">自动 · 只选零元授权</option><option value="professional">Professional · 专业</option><option value="personal">Personal · 个人</option></select></label>
-    <label class="field">领取后间隔<select id="delay"><option value="500">0.5 秒 · 快速</option><option value="1000">1 秒</option><option value="2000">2 秒</option><option value="4000">4 秒</option><option value="8000">8 秒</option></select></label></div>
+    <label class="field">领取后间隔<select id="delay"><option value="500">0.5 秒 · 快速</option><option value="0">0 秒 · 不额外等待</option><option value="1000">1 秒</option><option value="2000">2 秒</option><option value="4000">4 秒</option><option value="8000">8 秒</option></select></label></div>
     <label class="field">同时处理<select id="concurrency"><option value="3">3 项 · 并发快速</option><option value="5">5 项</option><option value="8">8 项</option><option value="16">16 项</option><option value="32">32 项</option><option value="1">1 项 · 串行</option></select></label>
-    <label class="field" style="margin-top:10px">请求间隔<select id="rate"><option value="500">0.5 秒 · 均衡</option><option value="1000">1 秒 · 稳妥</option><option value="2000">2 秒 · 慢速</option></select></label>
-    <p class="rate-hint" id="rate-hint"></p>
+    <label class="field" style="margin-top:10px">请求间隔<select id="rate"><option value="500">0.5 秒 · 均衡</option><option value="250">0.25 秒 · 快速</option><option value="100">0.1 秒 · 极速</option><option value="1000">1 秒 · 稳妥</option><option value="2000">2 秒 · 慢速</option></select></label>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:3px"><span class="rate-hint" id="rate-hint"></span><button class="link-btn" id="turbo" style="margin-left:8px;white-space:nowrap">一键极速</button></div>
     <label class="check" id="scroll-option"><input type="checkbox" id="scroll">自动向下滚动，继续处理新加载的素材</label>
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.5</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.6</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -62,6 +62,7 @@
   let progress = new Map(), retryRecords = new Map();
   let catalog = null, catalogAccount = null, catalogTimer, lastCatalogRender = 0, catalogRestart = false;
   const browserLabel = /Edg\//.test(navigator.userAgent) ? 'Edge' : /Chrome\//.test(navigator.userAgent) ? 'Chrome' : '当前浏览器';
+  const requestIntervals = [100, 250, 500, 1000, 2000];
   const catalogMode = () => $('#scope').value === 'quixel';
   const catalogKey = () => 'fabHelperCatalog_v1_' + progressAccount + '_quixel';
   const freshCatalog = () => ({ version: 2, sort: 'title', cursor: '', pages: 0, done: false });
@@ -84,7 +85,8 @@
       if (e.status === 429) requestGate.blockUntil(e.retryAt || Date.now() + 60000);
       setMessage(e.message, true);
       if (e.status === 429) {
-        $('#rate').value = String(Math.min(2000, Number($('#rate').value) * 2));
+        const index = requestIntervals.indexOf(Number($('#rate').value));
+        $('#rate').value = String(requestIntervals[Math.min(requestIntervals.length - 1, (index < 0 ? 2 : index) + 1)]);
         requestGate.interval = Number($('#rate').value);
         await saveSettings();
         try { await chrome.storage.local.set({ [cooldownKey]: { version: 1, until: requestGate.cooldownUntil } }); }
@@ -240,6 +242,7 @@
     $('#start').textContent = cooling ? '冷却 ' + Math.ceil(cooling / 1000) + ' 秒' : catalogMode() && catalog?.done && counts.failed ? '重试未完成' : done ? '继续入库' : '开始入库';
     $('#pause').disabled = !running || stopRequested;
     $('#scan').disabled = running;
+    $('#turbo').disabled = running;
     $('#retry').disabled = running || cooling > 0 || !counts.failed;
     $('#export').disabled = !all.length;
     $('#clear-memory').disabled = running || !progressReady || (!progress.size && !catalog);
@@ -457,7 +460,7 @@
         catch { progressNotice = '目录断点保存失败；刷新后可能从较早页重新检查，已入库素材不受影响'; }
       }
       render();
-      if (!catalog.done) await waitInterruptibly(500);
+      // The shared HTTP gate already paces the next page; no second page-level sleep.
     }
   }
 
@@ -501,6 +504,13 @@
   }
   for (const id of ['license', 'delay', 'rate', 'concurrency', 'scroll']) $('#' + id).addEventListener('change', saveSettings);
   $('#rate').addEventListener('change', () => { requestGate.interval = Number($('#rate').value); });
+  $('#turbo').addEventListener('click', async () => {
+    if (running) return;
+    $('#rate').value = '100'; $('#delay').value = '0'; $('#concurrency').value = '16';
+    requestGate.interval = 100;
+    setMessage('极速已设置：0.1 秒请求间隔、16 项并发、领取后不额外等待。开始后仍遵守限流冷却与自动降速。');
+    await saveSettings();
+  });
   $('#scope').addEventListener('change', async () => { items.clear(); catalog = null; await saveSettings(); discover(true); render(); });
   if (/\/sellers\/Quixel%20Megascans(?:\/|$)/i.test(location.pathname)) $('#scope').value = 'quixel';
   try {
@@ -508,8 +518,8 @@
     if (saved) {
       if (['page', 'quixel'].includes(saved.scope)) $('#scope').value = saved.scope;
       if (['auto', 'professional', 'personal'].includes(saved.license)) $('#license').value = saved.license;
-      if (['500', '1000', '2000', '4000', '8000'].includes(String(saved.delay))) $('#delay').value = String(saved.delay);
-      if (['500', '1000', '2000'].includes(String(saved.rate))) $('#rate').value = String(saved.rate);
+      if (['0', '500', '1000', '2000', '4000', '8000'].includes(String(saved.delay))) $('#delay').value = String(saved.delay);
+      if (requestIntervals.includes(Number(saved.rate))) $('#rate').value = String(saved.rate);
       if (['1', '3', '5', '8', '16', '32'].includes(String(saved.concurrency))) $('#concurrency').value = String(saved.concurrency);
       $('#scroll').checked = saved.scroll === true;
     }
