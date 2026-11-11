@@ -18,6 +18,7 @@ document.addEventListener('click', e => {
 }, true);
 window.chrome = { runtime: { id: 'preview-only', onMessage: { addListener() {} } }, storage: {local: {get: async()=>({}),set:async()=>{}}} };
 window.fetch = async (url, init={}) => {
+ if(url === '/i/users/me') return {ok:true,status:200,text:async()=>JSON.stringify({uid:'local-preview'})};
  const id = url.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/)?.[0];
  const asset = demoAssets.find(a=>a[0]===id);
  if(!asset) throw new Error('仅支持本地演示素材');

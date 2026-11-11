@@ -82,7 +82,7 @@
     }
     async request(path, method = 'GET', payload) {
       // No arbitrary URLs, payment endpoints, auth tokens or cross-origin requests.
-      if (!/^\/i\/(?:listings\/[a-f0-9-]+(?:\/prices-infos|\/add-to-library)?|users\/me\/listings-states\/[a-f0-9-]+)$/i.test(path)) throw new ApiError('请求路径不受支持');
+      if (!/^\/i\/(?:listings\/[a-f0-9-]+(?:\/prices-infos|\/add-to-library)?|users\/me(?:\/listings-states\/[a-f0-9-]+)?)$/i.test(path)) throw new ApiError('请求路径不受支持');
       if (method !== 'GET' && !(method === 'POST' && path.endsWith('/add-to-library'))) throw new ApiError('不支持的操作');
       const headers = { Accept: 'application/json' };
       if (method === 'POST') {
@@ -116,6 +116,11 @@
         }
         throw new ApiError(error.name === 'AbortError' ? '请求超时；如已提交入库，重试时会先核对拥有状态' : '网络请求失败，请检查网络或网页验证状态');
       } finally { clearTimeout(timeout); }
+    }
+    async account() {
+      const user = await this.request('/i/users/me');
+      const id = user?.uid ?? user?.id;
+      return user?.isAnonymous !== true && typeof id === 'string' && /^[a-z0-9_-]{1,128}$/i.test(id) ? id : null;
     }
     async state(id) {
       const result = await this.request('/i/users/me/listings-states/' + id);

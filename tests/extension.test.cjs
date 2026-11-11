@@ -191,10 +191,26 @@ async function uiFixture(t, options = {}) {
   t.after(() => dom.window.close());
   const w = dom.window;
   const calls = [];
-  let posts = 0;
+  let posts = 0, identityCalls = 0;
+  const storage = options.storage || {};
+  if (options.settings) storage.fabHelperSettings = options.settings;
   w.document.cookie = 'fab_csrftoken=fixture-only';
-  w.chrome = { runtime: { id: 'local-test', onMessage: { addListener() {} } }, storage: { local: { get: async () => options.settings ? { fabHelperSettings: options.settings } : {}, set: async () => {} } } };
+  w.chrome = { runtime: { id: 'local-test', onMessage: { addListener() {} } }, storage: { local: {
+    get: async key => {
+      if (key === null && options.storageReadError) throw new Error('fixture read failure');
+      return JSON.parse(JSON.stringify(key === null ? storage : (key in storage ? { [key]: storage[key] } : {})));
+    },
+    set: async values => {
+      if (options.storageWriteError) throw new Error('fixture write failure');
+      Object.assign(storage, JSON.parse(JSON.stringify(values)));
+    },
+    remove: async keys => { for (const key of keys) delete storage[key]; }
+  } } };
   w.fetch = async (url, init) => {
+    if (url === '/i/users/me') {
+      identityCalls++;
+      return response(options.accountResponse || { uid: options.account || 'fixture-account' }, options.accountStatus || 200);
+    }
     calls.push({ url, init });
     if (options.fetch) {
       if (init.method === 'POST') posts++;
@@ -213,7 +229,7 @@ async function uiFixture(t, options = {}) {
   w.eval(fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8'));
   await tick();
   const shadow = w.document.getElementById('fab-free-helper-root').shadowRoot;
-  return { w, shadow, calls, get posts() { return posts; }, get scans() { return scans; } };
+  return { w, shadow, calls, storage, get identityCalls() { return identityCalls; }, get posts() { return posts; }, get scans() { return scans; } };
 }
 
 test('webpage panel mounts, counts From Free and never auto-claims on load', async t => {
@@ -372,6 +388,7 @@ test('switching pages during a read cancels before any claim POST', async t => {
   const barrier = new Promise(resolve => { release = resolve; });
   const h = await uiFixture(t, { stateBarrier: barrier });
   h.shadow.querySelector('#start').click();
+  await until(() => h.calls.length === 1, 'initial ownership read starts');
   h.w.history.pushState({}, '', '/sellers/different-fixture');
   release();
   await tick();
@@ -387,4 +404,122 @@ test('extension manifest is Fab-only, local code only, and needs no native progr
   for (const file of manifest.content_scripts[0].js) assert.ok(fs.existsSync(path.join(__dirname, '../extension', file)));
   assert.ok(!manifest.externally_connectable);
   assert.ok(!manifest.web_accessible_resources);
+});
+
+test('identity accepts stable IDs only and never uses email or display names as cache identity', async () => {
+  for (const [user, expected] of [[{ uid: 'user-a' }, 'user-a'], [{ id: 'user-b' }, 'user-b'], [{ uid: 'user-c', isAnonymous: true }, null], [{ email: 'fixture@example.invalid', username: 'Display name' }, null], [{ uid: '../bad' }, null]]) {
+    const client = new Core.Client({ fetch: async (url, init) => {
+      assert.equal(url, '/i/users/me'); assert.equal(init.method, 'GET');
+      return response(user);
+    } });
+    assert.equal(await client.account(), expected);
+  }
+});
+
+test('confirmed ownership persists through a page reload with zero repeated asset requests', async t => {
+  const storage = {};
+  const first = await uiFixture(t, { storage, owned: true });
+  first.shadow.querySelector('#start').click();
+  await until(() => first.shadow.querySelector('#pause').disabled, 'first run should finish');
+  const key = 'fabHelperOwned_v1_fixture-account_' + A;
+  assert.equal(storage[key].status, 'owned');
+  assert.deepEqual(Object.keys(storage[key]).sort(), ['confirmedAt', 'status', 'version']);
+  const second = await uiFixture(t, { storage });
+  second.shadow.querySelector('#start').click();
+  await until(() => second.shadow.querySelector('#pause').disabled, 'cached run should finish');
+  assert.equal(second.identityCalls, 1);
+  assert.equal(second.calls.length, 0);
+  assert.equal(second.posts, 0);
+  assert.equal(second.shadow.querySelector('#owned').textContent, '1');
+  assert.match(second.shadow.querySelector('.note').textContent, /本地记录/);
+});
+
+test('cache restores known rows while only new assets are queried', async t => {
+  const storage = { ['fabHelperOwned_v1_fixture-account_' + A]: { version: 1, status: 'claimed', confirmedAt: Date.now() } };
+  const h = await uiFixture(t, { storage, owned: true, html: assetGrid([A, B]) });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#pause').disabled, 'mixed queue should finish');
+  assert.equal(h.calls.length, 1);
+  assert.ok(h.calls[0].url.endsWith(B));
+  assert.equal(h.shadow.querySelector('#owned').textContent, '2');
+});
+
+test('another Fab account never reuses existing ownership records', async t => {
+  const keyA = 'fabHelperOwned_v1_account-a_' + A;
+  const storage = { [keyA]: { version: 1, status: 'claimed', confirmedAt: Date.now() } };
+  const h = await uiFixture(t, { storage, account: 'account-b' });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#pause').disabled, 'new account should finish its own claim');
+  assert.equal(h.posts, 1);
+  assert.equal(storage['fabHelperOwned_v1_account-b_' + A].status, 'claimed');
+  assert.equal(storage[keyA].status, 'claimed');
+});
+
+test('unknown identity and invalid cache rows fall back to live verification', async t => {
+  for (const unknownIdentity of [false, true]) {
+    const storage = { ['fabHelperOwned_v1_fixture-account_' + A]: { version: 1, status: 'failed' } };
+    const h = await uiFixture(t, { storage, owned: true, accountResponse: unknownIdentity ? { email: 'fixture@example.invalid' } : undefined });
+    h.shadow.querySelector('#start').click();
+    await until(() => h.shadow.querySelector('#pause').disabled, 'fallback should finish');
+    assert.equal(h.calls.length, 1);
+    if (unknownIdentity) assert.match(h.shadow.querySelector('#memory').textContent, /无法识别/);
+  }
+});
+
+test('storage failure does not lose confirmed Fab ownership or report an unearned success', async t => {
+  for (const failures of [{ storageReadError: true }, { storageWriteError: true }]) {
+    const h = await uiFixture(t, failures);
+    h.shadow.querySelector('#start').click();
+    await until(() => h.shadow.querySelector('#pause').disabled, 'claim should finish despite local storage failure');
+    assert.equal(h.posts, 1);
+    assert.equal(h.shadow.querySelector('#claimed').textContent, '1');
+    assert.equal(h.shadow.querySelector('#failed').textContent, '0');
+    assert.match(h.shadow.querySelector('#memory').textContent, /失败/);
+  }
+});
+
+test('clearing local records touches only the active account and makes no Fab write', async t => {
+  const key = 'fabHelperOwned_v1_fixture-account_' + A;
+  const otherKey = 'fabHelperOwned_v1_another-account_' + A;
+  const storage = { [key]: { version: 1, status: 'owned' }, [otherKey]: { version: 1, status: 'owned' }, fabHelperSettings: { concurrency: '5' } };
+  const h = await uiFixture(t, { storage });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#pause').disabled, 'cache restoration should finish');
+  h.shadow.querySelector('#clear-memory').click();
+  await tick();
+  assert.equal(storage[key], undefined);
+  assert.ok(storage[otherKey]);
+  assert.ok(storage.fabHelperSettings);
+  assert.equal(h.posts, 0);
+  assert.equal(h.shadow.querySelector('#start').disabled, false);
+});
+
+for (const concurrency of [5, 8]) test(`${concurrency}-asset mode respects the selected in-flight limit and pauses cleanly`, async t => {
+  const ids = Array.from({ length: 10 }, (_, i) => i.toString(16).padStart(8, '0') + '-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const h = await uiFixture(t, { html: assetGrid(ids), stateBarrier: barrier, settings: { concurrency: String(concurrency) } });
+  assert.equal(h.shadow.querySelector('#concurrency').value, String(concurrency));
+  h.shadow.querySelector('#start').click();
+  try {
+    await until(() => h.calls.length === concurrency, 'selected number of ownership requests starts');
+    assert.equal([...h.shadow.querySelectorAll('.state')].filter(e => e.textContent === '核对中').length, concurrency);
+    h.shadow.querySelector('#pause').click();
+  } finally { release(); }
+  await until(() => h.shadow.querySelector('#concurrency').disabled === false, 'workers should pause');
+  assert.equal(h.calls.length, concurrency);
+  assert.equal(h.posts, 0);
+});
+
+test('a changed login session stops preflight before claiming or caching ownership', async t => {
+  let release;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const h = await uiFixture(t, { stateBarrier: barrier });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.calls.length === 1, 'preflight should start');
+  h.w.document.cookie = 'fab_csrftoken=different-fixture';
+  release();
+  await until(() => h.shadow.querySelector('#concurrency').disabled === false, 'session change should stop work');
+  assert.equal(h.posts, 0);
+  assert.equal(Object.keys(h.storage).filter(k => k.startsWith('fabHelperOwned')).length, 0);
 });
