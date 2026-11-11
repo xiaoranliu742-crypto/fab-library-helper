@@ -1,0 +1,10 @@
+node_modules/
+*.zip
+test-results/
+.env
+.env.*
+!.env.example
+*.log
+fab-results-*.json
+.DS_Store
+Thumbs.db
