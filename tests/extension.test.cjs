@@ -190,6 +190,8 @@ async function uiFixture(t, options = {}) {
   });
   t.after(() => dom.window.close());
   const w = dom.window;
+  if (options.userAgent) Object.defineProperty(w.navigator, 'userAgent', { value: options.userAgent });
+  if (options.userAgent) Object.defineProperty(w.navigator, 'userAgent', { value: options.userAgent });
   const calls = [];
   let posts = 0, identityCalls = 0;
   const storage = options.storage || {};
@@ -202,6 +204,7 @@ async function uiFixture(t, options = {}) {
     },
     set: async values => {
       if (options.storageWriteError) throw new Error('fixture write failure');
+      if (options.beforeStorageSet) await options.beforeStorageSet(values);
       Object.assign(storage, JSON.parse(JSON.stringify(values)));
     },
     remove: async keys => { for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key]; }
@@ -528,6 +531,7 @@ test('a changed login session stops preflight before claiming or caching ownersh
 const catalogRow = id => ({ uid: id, title: 'Catalogue ' + id, isFree: true, user: { sellerName: 'Quixel Megascans' }, thumbnails: [{ uri: 'https://example.invalid/never-load.jpg' }] });
 const catalogPage = (ids, next = null) => ({ results: ids.map(catalogRow), cursors: { next } });
 const catalogRecord = account => 'fabHelperCatalog_v1_' + account + '_quixel';
+const retryRecord = (account, id) => 'fabHelperRetry_v1_' + account + '_' + id;
 const searchUrl = url => new URL(url, 'https://www.fab.com');
 
 test('catalogue reads validate the seller, identifiers and cursors and retain no thumbnail data', async () => {
@@ -558,13 +562,14 @@ test('catalogue reads validate the seller, identifiers and cursors and retain no
 test('catalogue API additions accept only the fixed free seller query and at most 24 state IDs', async () => {
   const h = harness();
   for (const url of [
-    '/i/listings/search?seller=Other&is_free=1&count=24&sort_by=listingTypeWeight',
-    '/i/listings/search?seller=Quixel%20Megascans&is_free=0&count=24&sort_by=listingTypeWeight',
-    '/i/listings/search?seller=Quixel%20Megascans&is_free=1&count=24&sort_by=listingTypeWeight&token=x',
+    '/i/listings/search?seller=Quixel%20Megascans&is_free=1&count=24&sort_by=listingTypeWeight',
+    '/i/listings/search?seller=Other&is_free=1&count=24&sort_by=title',
+    '/i/listings/search?seller=Quixel%20Megascans&is_free=0&count=24&sort_by=title',
+    '/i/listings/search?seller=Quixel%20Megascans&is_free=1&count=24&sort_by=title&token=x',
     '/i/users/me/listings-states?listing_ids=invalid',
     '/i/users/me/listings-states?' + Array.from({ length: 25 }, () => 'listing_ids=' + A).join('&')
   ]) await assert.rejects(h.client.request(url), /请求路径/);
-  await assert.rejects(h.client.request('/i/listings/search?seller=Quixel%20Megascans&is_free=1&count=24&sort_by=listingTypeWeight', 'POST'), /请求路径/);
+  await assert.rejects(h.client.request('/i/listings/search?seller=Quixel%20Megascans&is_free=1&count=24&sort_by=title', 'POST'), /请求路径/);
   assert.equal(h.calls.length, 0);
 });
 
@@ -677,7 +682,7 @@ test('unrecognized bulk states fall back to individual ownership verification', 
   assert.equal(h.shadow.querySelector('#owned').textContent, '1');
 });
 
-test('an incomplete page never advances its cursor, and retry safely completes it', async t => {
+test('a failed asset is saved separately and can be retried after the directory finishes', async t => {
   let fail = true, submitted = false;
   const h = await uiFixture(t, { settings: { scope: 'quixel' }, fetch: async (url, init) => {
     if (url.includes('/listings/search?')) return response(catalogPage([A]));
@@ -689,12 +694,15 @@ test('an incomplete page never advances its cursor, and retry safely completes i
   } });
   h.shadow.querySelector('#start').click();
   await until(() => h.shadow.querySelector('#scope').disabled === false, 'failed page should stop');
-  assert.equal(h.storage[catalogRecord('fixture-account')], undefined);
+  assert.equal(h.storage[catalogRecord('fixture-account')].done, true);
+  assert.equal(h.storage[retryRecord('fixture-account', A)].version, 1);
   assert.equal(h.shadow.querySelector('#failed').textContent, '1');
   fail = false;
   h.shadow.querySelector('#retry').click();
   await until(() => h.shadow.querySelector('#scope').disabled === false, 'retry should finish');
   assert.equal(h.posts, 1);
+  assert.equal(h.storage[retryRecord('fixture-account', A)], undefined);
+  assert.equal(h.calls.filter(c => c.url.includes('/listings/search?')).length, 1);
   assert.equal(h.storage[catalogRecord('fixture-account')].done, true);
 });
 
@@ -760,4 +768,285 @@ test('a new account starts from page one and never reuses another account catalo
   assert.equal(h.calls.length, 2);
   assert.equal(storage[catalogRecord('new-account')].pages, 1);
   assert.equal(storage[catalogRecord('fixture-account')].pages, 100);
+});
+
+
+test('stable title ordering uses position cursors rather than the repeating weight offset', async () => {
+  const next = 'bz0zJnA9QWZyaWNhbitGbGFn';
+  const seen = [];
+  const client = new Core.Client({ fetch: async url => {
+    const p = searchUrl(url).searchParams;
+    assert.equal(p.get('sort_by'), 'title');
+    seen.push(p.get('cursor'));
+    return response(catalogPage([p.has('cursor') ? B : A], p.has('cursor') ? null : next));
+  } });
+  const first = await client.quixelPage();
+  await client.quixelPage(first.next);
+  assert.deepEqual(seen, [null, next]);
+});
+
+test('legacy weight checkpoints migrate once, retain ownership, and resume the new title checkpoint after reload', async t => {
+  const key = catalogRecord('fixture-account');
+  const ownedKey = 'fabHelperOwned_v1_fixture-account_' + A;
+  const owned = { version: 1, status: 'owned', confirmedAt: 12345 };
+  const storage = { [key]: { version: 1, cursor: 'bz01MDI0', pages: 210, done: false }, [ownedKey]: owned };
+  const first = await uiFixture(t, { storage, settings: { scope: 'quixel' }, fetch: async url => {
+    const p = searchUrl(url);
+    assert.equal(p.pathname, '/i/listings/search');
+    if (p.searchParams.has('cursor')) {
+      assert.equal(p.searchParams.get('cursor'), 'stable-second');
+      return response({}, 500);
+    }
+    assert.equal(p.searchParams.get('sort_by'), 'title');
+    return response(catalogPage([A], 'stable-second'));
+  } });
+  first.shadow.querySelector('#start').click();
+  await until(() => first.shadow.querySelector('#scope').disabled === false, 'migrated scan should save a title checkpoint before the simulated network failure');
+  assert.deepEqual(storage[ownedKey], owned);
+  assert.equal(storage[key].version, 2);
+  assert.equal(storage[key].sort, 'title');
+  assert.equal(storage[key].cursor, 'stable-second');
+  assert.equal(storage[key].pages, 1);
+  assert.equal(storage[key].done, false);
+  assert.equal(first.calls.length, 2);
+  assert.equal(first.posts, 0);
+  const second = await uiFixture(t, { storage, fetch: async url => {
+    const p = searchUrl(url);
+    if (p.pathname === '/i/listings/search') {
+      assert.equal(p.searchParams.get('cursor'), 'stable-second');
+      return response(catalogPage([B]));
+    }
+    return response([{ uid: B, acquired: true }]);
+  } });
+  second.shadow.querySelector('#start').click();
+  await until(() => second.shadow.querySelector('#scope').disabled === false, 'reload should resume the title cursor');
+  assert.equal(storage[key].done, true);
+  assert.equal(storage[key].pages, 2);
+  assert.equal(second.calls.filter(c => c.url.includes('/listings/search?')).length, 1);
+  assert.equal(second.posts, 0);
+});
+
+test('repeated title cursors stop safely and the Continue button can retry the same checkpoint', async t => {
+  const key = catalogRecord('fixture-account');
+  const storage = { [key]: { version: 2, sort: 'title', cursor: 'stable-page', pages: 210, done: false }, ['fabHelperOwned_v1_fixture-account_' + A]: { version: 1, status: 'owned' } };
+  let repeated = true;
+  const h = await uiFixture(t, { storage, settings: { scope: 'quixel' }, fetch: async url => {
+    assert.equal(searchUrl(url).searchParams.get('cursor'), 'stable-page');
+    return response(catalogPage([A], repeated ? 'stable-page' : null));
+  } });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'a repeated page should stop and drain');
+  assert.equal(storage[key].cursor, 'stable-page');
+  assert.equal(storage[key].pages, 210);
+  assert.equal(h.shadow.querySelector('#start').disabled, false);
+  assert.match(h.shadow.querySelector('#message').textContent, /分页断点异常/);
+  repeated = false;
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'Continue should finish when the endpoint recovers');
+  assert.equal(storage[key].done, true);
+  assert.equal(storage[key].pages, 211);
+  assert.equal(h.posts, 0);
+  assert.equal(h.calls.length, 2);
+});
+
+test('browser-local ownership, checkpoints and clearing stay isolated for the same Fab account', async t => {
+  const key = catalogRecord('fixture-account');
+  const edgeStore = { [key]: { version: 2, sort: 'title', cursor: 'edge-page', pages: 2, done: false }, ['fabHelperOwned_v1_fixture-account_' + A]: { version: 1, status: 'owned' } };
+  const chromeStore = { [key]: { version: 2, sort: 'title', cursor: 'chrome-page', pages: 8, done: false }, ['fabHelperOwned_v1_fixture-account_' + B]: { version: 1, status: 'owned' } };
+  edgeStore[retryRecord('fixture-account', C)] = { version: 1, name: 'Edge failed', note: 'HTTP 500' };
+  chromeStore[retryRecord('fixture-account', C)] = { version: 1, name: 'Chrome failed', note: 'HTTP 404' };
+  const originalChrome = JSON.stringify(chromeStore);
+  function browserFetch(cursor, unknown) { return async url => {
+    const p = searchUrl(url);
+    if (p.pathname === '/i/listings/search') {
+      assert.equal(p.searchParams.get('cursor'), cursor);
+      return response(catalogPage([A, B]));
+    }
+    assert.deepEqual(p.searchParams.getAll('listing_ids'), [unknown]);
+    return response([{ uid: unknown, acquired: true }]);
+  }; }
+  const edge = await uiFixture(t, { storage: edgeStore, settings: { scope: 'quixel' }, userAgent: 'Mozilla/5.0 Chrome/140.0 Edg/140.0', fetch: browserFetch('edge-page', B) });
+  edge.shadow.querySelector('#start').click();
+  await until(() => edge.shadow.querySelector('#scope').disabled === false, 'Edge should finish its own checkpoint');
+  assert.equal(JSON.stringify(chromeStore), originalChrome);
+  assert.match(edge.shadow.querySelector('#memory').textContent, /Edge/);
+  const chrome = await uiFixture(t, { storage: chromeStore, settings: { scope: 'quixel' }, userAgent: 'Mozilla/5.0 Chrome/140.0', fetch: browserFetch('chrome-page', A) });
+  chrome.shadow.querySelector('#start').click();
+  await until(() => chrome.shadow.querySelector('#scope').disabled === false, 'Chrome should finish its own checkpoint');
+  assert.match(chrome.shadow.querySelector('#memory').textContent, /Chrome/);
+  assert.equal(edgeStore[key].pages, 3);
+  assert.equal(chromeStore[key].pages, 9);
+  const completedChrome = JSON.stringify(chromeStore);
+  edge.shadow.querySelector('#clear-memory').click();
+  await tick();
+  assert.equal(edgeStore[key], undefined);
+  assert.equal(edgeStore[retryRecord('fixture-account', C)], undefined);
+  assert.equal(chromeStore[retryRecord('fixture-account', C)].note, 'HTTP 404');
+  assert.equal(JSON.stringify(chromeStore), completedChrome);
+  assert.equal(edge.posts + chrome.posts, 0);
+});
+
+
+test('an HTTP 400 bundle failure is durable before the next cursor and Continue can retry it independently', async t => {
+  let release, saving = false, fail = true, submitted = false;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const key = catalogRecord('fixture-account'), retryKey = retryRecord('fixture-account', A);
+  const storage = { ['fabHelperOwned_v1_fixture-account_' + B]: {version:1,status:'owned'}, ['fabHelperOwned_v1_fixture-account_' + C]: {version:1,status:'owned'} };
+  const h = await uiFixture(t, { storage, settings: {scope:'quixel'}, beforeStorageSet: async values => {
+    if (retryKey in values && !saving) { saving = true; await barrier; }
+  }, fetch: async (url,init) => {
+    const p = searchUrl(url);
+    if (p.pathname === '/i/listings/search') {
+      if (p.searchParams.has('cursor')) {
+        assert.ok(storage[retryKey], 'failed item must be saved before advancing');
+        assert.equal(storage[key].cursor, 'next-page');
+        return response(catalogPage([C]));
+      }
+      return response(catalogPage([A,B], 'next-page'));
+    }
+    if (p.pathname === '/i/users/me/listings-states') return response([{uid:A,acquired:submitted}]);
+    if (url.includes('listings-states/')) return response({acquired:submitted});
+    if (init.method === 'POST') {if (fail) return response({},400); submitted=true;return response(null,204);}
+    return response(url.endsWith('/prices-infos') ? zero : {...detail,title:'Alpine Tundra Bundle',listingType:'bundle'});
+  } });
+  h.shadow.querySelector('#start').click();
+  try {
+    await until(()=>saving, 'failure queue write should start');
+    assert.equal(storage[key],undefined);
+    assert.equal(h.calls.filter(c=>c.url.includes('/listings/search?')).length,1);
+  } finally {release();}
+  await until(()=>storage[key]?.done && !h.shadow.querySelector('#scope').disabled,'later page should finish despite one failed asset');
+  assert.equal(h.posts,1);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'0');
+  assert.match(storage[retryKey].note,/HTTP 400/);
+  assert.equal(h.shadow.querySelector('#owned').textContent,'2');
+  assert.equal(h.shadow.querySelector('#failed').textContent,'1');
+  assert.ok(h.shadow.querySelector('.row .name').href.endsWith(A));
+  assert.match(h.shadow.querySelector('#message').textContent,/待重试/);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+  assert.equal(h.shadow.querySelector('#start').textContent,'重试未完成');
+  fail=false;
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'Continue should retry only unresolved items');
+  assert.equal(h.posts,2);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
+  assert.equal(storage[retryKey],undefined);
+  assert.equal(storage[key].pages,2);
+  assert.equal(h.calls.filter(c=>c.url.includes('/listings/search?')).length,2);
+  assert.equal(h.shadow.querySelector('#failed').textContent,'0');
+});
+
+test('saved failed assets survive reload, ignore other accounts and clear only with the active account', async t => {
+  const key=catalogRecord('fixture-account'), retryKey=retryRecord('fixture-account',A), other=retryRecord('other-account',C);
+  const checkpoint={version:2,sort:'title',cursor:'',pages:210,done:true};
+  const storage={ [key]:checkpoint, [retryKey]:{version:1,name:'Recover me',note:'HTTP 404'}, [other]:{version:1,name:'Other account',note:'HTTP 500'} };
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'},fetch:async url=>{
+    assert.ok(url.endsWith('/listings-states/'+A));
+    return response({acquired:true});
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'finished directory should restore failures');
+  assert.equal(h.calls.length,0);
+  assert.equal(h.shadow.querySelector('#failed').textContent,'1');
+  assert.match(h.shadow.querySelector('#list').textContent,/HTTP 404/);
+  h.shadow.querySelector('#retry').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'saved failure should be retried independently');
+  assert.equal(h.calls.length,1);
+  assert.equal(h.posts,0);
+  assert.equal(storage[retryKey],undefined);
+  assert.deepEqual(storage[key],checkpoint);
+  assert.equal(storage[other].note,'HTTP 500');
+  h.shadow.querySelector('#clear-memory').click();
+  await tick();
+  assert.equal(storage[key],undefined);
+  assert.equal(storage[other].note,'HTTP 500');
+});
+
+test('failure queue storage errors never advance the page or discard the failing asset', async t => {
+  const key=catalogRecord('fixture-account');
+  const checkpoint={version:2,sort:'title',cursor:'keep-this-page',pages:7,done:false};
+  const storage={[key]:checkpoint};
+  const h=await uiFixture(t,{storage,storageWriteError:true,settings:{scope:'quixel'},fetch:async url=>{
+    if(url.includes('/listings/search?')) return response(catalogPage([A],'next-page'));
+    if(url.includes('/listings-states?')) return response([{uid:A,acquired:false}]);
+    if(url.includes('listings-states/')) return response({acquired:false});
+    if(url.endsWith('/prices-infos')) return response({},500);
+    return response(detail);
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'storage error should safely stop');
+  assert.deepEqual(storage[key],checkpoint);
+  assert.equal(storage[retryRecord('fixture-account',A)],undefined);
+  assert.equal(h.shadow.querySelector('#failed').textContent,'1');
+  assert.match(h.shadow.querySelector('#message').textContent,/保存失败/);
+  assert.match(h.shadow.querySelector('.row .note').textContent,/HTTP 500/);
+  assert.equal(h.calls.filter(c=>c.url.includes('/listings/search?')).length,1);
+  assert.equal(h.posts,0);
+});
+
+test('rate limiting while retrying saved failures keeps them and sends no claim', async t => {
+  const key=catalogRecord('fixture-account'), retryKey=retryRecord('fixture-account',A);
+  const checkpoint={version:2,sort:'title',cursor:'',pages:9,done:true};
+  const storage={[key]:checkpoint,[retryKey]:{version:1,name:'Retry',note:'HTTP 500'}};
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'},fetch:async()=>response({},429)});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'failure should restore');
+  h.shadow.querySelector('#retry').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'rate limited retry should stop');
+  assert.ok(storage[retryKey]);
+  assert.deepEqual(storage[key],checkpoint);
+  assert.match(h.shadow.querySelector('#message').textContent,/限流/);
+  assert.equal(h.posts,0);
+  assert.equal(h.calls.length,1);
+});
+
+
+test('pausing a saved-failure retry keeps Continue available and the durable queue intact', async t => {
+  const key=catalogRecord('fixture-account'), retryKey=retryRecord('fixture-account',A);
+  const storage={[key]:{version:2,sort:'title',cursor:'',pages:3,done:true},[retryKey]:{version:1,name:'Paused retry',note:'HTTP 500'}};
+  let release;const barrier=new Promise(resolve=>{release=resolve;});
+  const h=await uiFixture(t,{storage,stateBarrier:barrier,settings:{scope:'quixel'}});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'restore failure');
+  h.shadow.querySelector('#start').click();
+  try {
+    await until(()=>h.calls.length===1,'retry state read should start');
+    h.shadow.querySelector('#pause').click();
+  } finally {release();}
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'paused retry should drain');
+  assert.equal(h.posts,0);
+  assert.ok(storage[retryKey]);
+  assert.equal(h.shadow.querySelector('#failed').textContent,'1');
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'Continue should resume the paused failed item');
+  assert.equal(h.posts,1);
+  assert.equal(storage[retryKey],undefined);
+  assert.ok(h.calls.every(c=>!c.url.includes('/listings/search?')));
+});
+
+test('changing accounts before a retry never uses the old failures and leaves Start usable', async t => {
+  const key=catalogRecord('fixture-account'), retryKey=retryRecord('fixture-account',A);
+  const storage={[key]:{version:2,sort:'title',cursor:'',pages:3,done:true},[retryKey]:{version:1,name:'Old account',note:'HTTP 500'}};
+  const account={uid:'fixture-account'};
+  const h=await uiFixture(t,{storage,accountResponse:account,settings:{scope:'quixel'},fetch:async url=>{
+    assert.ok(url.includes('/listings/search?'));
+    assert.equal(searchUrl(url).searchParams.has('cursor'),false);
+    return response(catalogPage([]));
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'restore old failure');
+  account.uid='other-account';
+  h.shadow.querySelector('#retry').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'account change should stop the retry');
+  assert.equal(h.calls.length,0);
+  assert.ok(storage[retryKey]);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+  assert.equal(h.shadow.querySelector('#failed').textContent,'0');
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'new account should be able to start its own directory');
+  assert.ok(storage[catalogRecord('other-account')].done);
+  assert.equal(storage[key].pages,3);
+  assert.ok(storage[retryKey]);
+  assert.equal(h.posts,0);
 });

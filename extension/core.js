@@ -86,7 +86,7 @@
       const params = url.searchParams;
       const ordinary = !url.search && /^\/i\/(?:listings\/[a-f0-9-]+(?:\/prices-infos|\/add-to-library)?|users\/me(?:\/listings-states\/[a-f0-9-]+)?)$/i.test(path);
       const catalogue = url.pathname === '/i/listings/search' && params.get('seller') === 'Quixel Megascans' &&
-        params.get('is_free') === '1' && params.get('count') === '24' && params.get('sort_by') === 'listingTypeWeight' &&
+        params.get('is_free') === '1' && params.get('count') === '24' && params.get('sort_by') === 'title' &&
         [...params.keys()].every(key => ['seller', 'is_free', 'count', 'sort_by', 'cursor'].includes(key) && params.getAll(key).length === 1) &&
         (!params.has('cursor') || (params.get('cursor').length > 0 && params.get('cursor').length <= 2048));
       const ids = params.getAll('listing_ids');
@@ -140,7 +140,9 @@
     }
     async quixelPage(cursor = '') {
       if (typeof cursor !== 'string' || cursor.length > 2048) throw new ApiError('目录断点无法识别');
-      const params = new URLSearchParams({ seller: 'Quixel Megascans', sort_by: 'listingTypeWeight', is_free: '1', count: '24' });
+      // Type weights have thousands of ties: Fab repeats the offset cursor at 5024.
+      // Title ordering returns a position cursor, so keep this order fixed across resumes.
+      const params = new URLSearchParams({ seller: 'Quixel Megascans', sort_by: 'title', is_free: '1', count: '24' });
       if (cursor) params.set('cursor', cursor);
       const data = await this.request('/i/listings/search?' + params);
       if (!Array.isArray(data?.results) || data.results.length > 24 || !data.cursors || !('next' in data.cursors)) throw new ApiError('目录结构无法识别，已停止翻页');

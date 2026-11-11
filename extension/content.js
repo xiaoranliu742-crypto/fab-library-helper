@@ -48,7 +48,7 @@
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.0</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.2</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -57,11 +57,12 @@
   let route = location.pathname + location.search, message = '', error = false;
   const progressPrefix = 'fabHelperOwned_v1_';
   let progressAccount = null, progressReady = false, progressNotice = '', runCsrf = '';
-  let progress = new Map();
+  let progress = new Map(), retryRecords = new Map();
   let catalog = null, catalogAccount = null, catalogTimer, lastCatalogRender = 0, catalogRestart = false;
+  const browserLabel = /Edg\//.test(navigator.userAgent) ? 'Edge' : /Chrome\//.test(navigator.userAgent) ? 'Chrome' : '当前浏览器';
   const catalogMode = () => $('#scope').value === 'quixel';
   const catalogKey = () => 'fabHelperCatalog_v1_' + progressAccount + '_quixel';
-  const freshCatalog = () => ({ version: 1, cursor: '', pages: 0, done: false });
+  const freshCatalog = () => ({ version: 2, sort: 'title', cursor: '', pages: 0, done: false });
   const labels = { pending: '待核对', processing: '核对中', claimed: '已入库', owned: '已拥有', skipped: '已跳过', failed: '失败' };
   const marks = { pending: '·', processing: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -71,6 +72,7 @@
 
   const csrf = () => document.cookie.match(/(?:^|;\s*)fab_csrftoken=([^;]+)/)?.[1] || '';
   const recordPrefix = () => progressPrefix + progressAccount + '_';
+  const retryPrefix = () => 'fabHelperRetry_v1_' + progressAccount + '_';
   function restoreItem(item) {
     if (progressReady && progress.has(item.id)) {
       item.status = 'owned'; item.note = '本地记录：此前已确认拥有 · 已跳过网络查询';
@@ -81,7 +83,7 @@
     try { account = await client.account(); }
     catch (e) { if (e.halt) throw e; }
     if (!account || account !== progressAccount) for (const item of items.values()) { item.status = 'pending'; item.note = ''; }
-    progressAccount = account; progressReady = false; progress = new Map();
+    progressAccount = account; progressReady = false; progress = new Map(); retryRecords = new Map();
     progressNotice = account ? '' : '无法识别当前 Fab 账号，本轮逐项联网核对，不复用本地记录';
     if (!account) return;
     try {
@@ -91,6 +93,11 @@
         if (!key.startsWith(prefix)) continue;
         const id = key.slice(prefix.length);
         if (Core.listingId('/listings/' + id) === id && record?.version === 1 && ['claimed', 'owned'].includes(record.status)) progress.set(id, record);
+      }
+      for (const [key, record] of Object.entries(saved)) {
+        if (!key.startsWith(retryPrefix())) continue;
+        const id = key.slice(retryPrefix().length);
+        if (Core.listingId('/listings/' + id) === id && record?.version === 1 && typeof record.name === 'string' && typeof record.note === 'string') retryRecords.set(id, { version: 1, name: record.name.slice(0, 240), note: record.note.slice(0, 1000) });
       }
       progressReady = true;
       for (const item of items.values()) restoreItem(item);
@@ -112,6 +119,35 @@
       progressReady = false;
       progressNotice = '本地进度保存失败，刷新后可能需要重新查询；已入库素材仍保存在 Fab';
     }
+  }
+
+  function restoreRetries() {
+    for (const [id, record] of retryRecords) {
+      if (progress.has(id)) continue;
+      const item = items.get(id) || { id, name: record.name, href: 'https://www.fab.com/listings/' + id, hint: 'unknown' };
+      item.status = 'failed'; item.note = record.note; items.set(id, item);
+    }
+  }
+  async function saveRetries(rows) {
+    if (!rows.length) return true;
+    if (!progressReady || !progressAccount || runCsrf !== csrf()) return false;
+    const saved = {};
+    for (const item of rows) saved[retryPrefix() + item.id] = { version: 1, name: item.name.slice(0, 240), note: item.note.slice(0, 1000) };
+    try {
+      // A failed asset must be durable before its directory cursor can advance.
+      await chrome.storage.local.set(saved);
+      for (const item of rows) retryRecords.set(item.id, saved[retryPrefix() + item.id]);
+      return true;
+    } catch { return false; }
+  }
+  async function forgetRetries(rows) {
+    if (!progressReady || runCsrf !== csrf()) return;
+    const ids = rows.filter(item => ['claimed', 'owned', 'skipped'].includes(item.status) && retryRecords.has(item.id)).map(item => item.id);
+    if (!ids.length) return;
+    try {
+      await chrome.storage.local.remove(ids.map(id => retryPrefix() + id));
+      for (const id of ids) retryRecords.delete(id);
+    } catch { progressNotice = '待重试记录清理失败，之后仍可核对拥有状态'; }
   }
 
   function render() {
@@ -136,19 +172,21 @@
     const pct = all.length ? Math.round(100 * done / all.length) : 0;
     $('.fill').style.width = pct + '%';
     $('.track').setAttribute('aria-valuenow', pct);
-    $('#start').disabled = running || (catalogMode() ? catalog?.done === true : !all.some(i => i.status === 'pending') && !$('#scroll').checked);
-    $('#start').textContent = done ? '继续入库' : '开始入库';
+    $('#start').disabled = running || (catalogMode() ? catalog?.done === true && !counts.failed : !all.some(i => i.status === 'pending') && !$('#scroll').checked);
+    $('#start').textContent = catalogMode() && catalog?.done && counts.failed ? '重试未完成' : done ? '继续入库' : '开始入库';
     $('#pause').disabled = !running || stopRequested;
     $('#scan').disabled = running;
     $('#retry').disabled = running || !counts.failed;
     $('#export').disabled = !all.length;
     $('#clear-memory').disabled = running || !progressReady || (!progress.size && !catalog);
-    $('#memory').textContent = progressNotice || (progressReady ? `本地已记住 ${progress.size} 项 · 同账号再次遇到时直接跳过` : '本地进度：开始后自动保存已确认项目');
+    $('#memory').textContent = browserLabel + ' · ' + (progressReady ? `本地已记住 ${progress.size} 项 · ${progressNotice || '同账号再次遇到时直接跳过'}` : progressNotice || '本地进度：开始后自动保存已确认项目');
     for (const el of [$('#license'), $('#delay'), $('#concurrency'), $('#scroll'), $('#scope')]) el.disabled = running;
     $('#scroll-option').hidden = catalogMode();
     $('#scan').textContent = catalogMode() ? '从头检查' : '重新扫描';
     $('#found').textContent = catalogMode() ? `整库目录 · 本轮 ${all.length} 项 · 已完成 ${catalog?.pages || 0} 页` : '当前网页 · ' + all.length + ' 项';
-    const visible = all.filter(i => i.status === 'processing').concat(all.filter(i => i.status !== 'processing').slice(-60));
+    const priority = all.filter(i => i.status === 'processing').concat(all.filter(i => i.status === 'failed')).slice(0, 60);
+    const room = 60 - priority.length;
+    const visible = priority.concat(room > 0 ? all.filter(i => !['processing', 'failed'].includes(i.status)).slice(-room) : []);
     $('#list').innerHTML = visible.length ? visible.map(i => `<div class="row"><span class="mark ${i.status === 'claimed' ? 'green' : ''}">${marks[i.status]}</span><div class="meta"><a class="name" href="${escape(i.href)}" target="_blank" rel="noopener noreferrer" title="${escape(i.name)}">${escape(i.name)}</a><div class="note">${escape(i.note || (i.hint === 'free' ? '网页标记免费 · 入库前再次核对价格' : i.hint === 'owned' ? '网页标记已拥有 · 将核对账号状态' : '将核对价格与拥有状态'))}</div></div><span class="state">${labels[i.status]}</span></div>`).join('') : '<div class="empty">当前页面尚未发现素材卡片。<br>请打开卖家页或搜索结果，等待加载后重新扫描。</div>';
   }
   function setMessage(text, isError = false) { message = text; error = isError; render(); }
@@ -175,12 +213,15 @@
     const until = Date.now() + ms;
     while (!shouldStop() && Date.now() < until) await sleep(Math.min(150, until - Date.now()));
   }
-  async function run() {
+  async function run(retryIds = null) {
     if (running) return;
+    if (retryIds === null && catalogMode() && catalog?.done) retryIds = [...items.values()].filter(item => item.status === 'failed').map(item => item.id);
+    if (retryIds && !retryIds.length) return;
+    const retryAccount = progressAccount;
     running = true; stopRequested = false;
     runCsrf = csrf();
     const preference = $('#license').value, delay = Number($('#delay').value), autoScroll = $('#scroll').checked;
-    const fullCatalog = catalogMode();
+    const fullCatalog = catalogMode() && !retryIds;
     const requested = Number($('#concurrency').value);
     const concurrency = [1, 3, 5, 8, 16, 32].includes(requested) ? requested : 3;
     let emptyRounds = 0;
@@ -197,6 +238,7 @@
         try {
           Object.assign(item, await client.claim(item, preference, shouldStop));
           await remember(item);
+          await forgetRetries([item]);
         } catch (e) {
           if (e instanceof Core.Paused) { item.status = 'pending'; render(); return; }
           item.status = 'failed'; item.note = e.message;
@@ -210,9 +252,33 @@
       setMessage('正在识别 Fab 账号并恢复本地进度…');
       await loadProgress();
       render();
+      if (retryIds) {
+        if (retryAccount !== progressAccount) {
+          catalog = null; catalogAccount = null; items.clear();
+          throw new Core.ApiError('Fab 账号已变化，请先在当前账号开始检查，再重试失败项。');
+        }
+        restoreRetries();
+        const retried = retryIds.map(id => items.get(id)).filter(Boolean);
+        for (const item of retried) { item.status = 'pending'; item.note = ''; restoreItem(item); }
+        queue = retried.filter(item => item.status === 'pending'); queueIndex = 0;
+        const workers = await Promise.allSettled(Array.from({ length: concurrency }, () => worker()));
+        const failure = workers.find(result => result.status === 'rejected');
+        if (failure) throw failure.reason;
+        if (shouldStop()) {
+          for (const item of retried) if (['pending', 'processing'].includes(item.status)) { item.status = 'failed'; item.note = retryRecords.get(item.id)?.note || '重试已暂停，可继续处理'; }
+          if (!error) setMessage('已暂停重试，原目录断点和待重试记录保留。');
+          return;
+        }
+        const failed = retried.filter(item => item.status === 'failed');
+        if (catalogMode() && !await saveRetries(failed)) throw new Core.ApiError('待重试记录保存失败，原记录和目录断点保留。');
+        await forgetRetries(retried);
+        setMessage(failed.length ? '仍有 ' + failed.length + ' 项待重试；首项：' + failed[0].note : '本次重试完成，已确认项目已从待重试记录中移除。', failed.length > 0);
+        return;
+      }
       if (fullCatalog) {
         await runCatalog(concurrency, worker, value => { queue = value; queueIndex = 0; });
-        if (!error) setMessage(shouldStop() ? '已暂停。目录断点和已确认拥有记录会保留；继续时不必滚动回原位置。' : '已到 Quixel 免费目录末尾。本轮处理完成；新上架或价格更新后可点“从头检查”。');
+        const failed = [...items.values()].filter(item => item.status === 'failed');
+        if (!error) setMessage(shouldStop() ? '已暂停。目录断点和已确认拥有记录会保留；继续时不必滚动回原位置。' : failed.length ? '目录读取完毕，仍有 ' + failed.length + ' 项待重试。首项：' + failed[0].note + '；点击“重试失败”单独处理。' : '已到 Quixel 免费目录末尾。本轮处理完成；新上架或价格更新后可点“从头检查”。', !shouldStop() && failed.length > 0);
         return;
       }
       while (!shouldStop()) {
@@ -254,10 +320,17 @@
         try {
           if (reset) await chrome.storage.local.remove(catalogKey());
           const saved = (await chrome.storage.local.get(catalogKey()))[catalogKey()];
-          if (saved?.version === 1 && typeof saved.cursor === 'string' && saved.cursor.length <= 2048 && Number.isSafeInteger(saved.pages) && saved.pages >= 0 && typeof saved.done === 'boolean') catalog = { version: 1, cursor: saved.cursor, pages: saved.pages, done: saved.done };
+          if (saved?.version === 2 && saved.sort === 'title' && typeof saved.cursor === 'string' && saved.cursor.length <= 2048 && Number.isSafeInteger(saved.pages) && saved.pages >= 0 && typeof saved.done === 'boolean') {
+            catalog = { version: 2, sort: 'title', cursor: saved.cursor, pages: saved.pages, done: saved.done };
+          } else if (saved) {
+            // Offset cursors belong to the old weight order and must never be reused with titles.
+            // Ownership keys are deliberately untouched, including records made by older versions.
+            progressNotice = '已改用标题排序，重建目录位置；已拥有记录保留';
+          }
         } catch { progressNotice = '目录断点读取失败，将从首页检查；已确认拥有记录仍可复用'; }
       }
     }
+    restoreRetries();
     const visited = new Set();
     while (!shouldStop() && !catalog.done) {
       if (visited.has(catalog.cursor) || visited.size >= 2000) throw new Core.ApiError('目录分页重复或过多，已停止；保留断点以供核查');
@@ -267,7 +340,7 @@
       if (shouldStop()) return;
       const batch = page.items.map(row => {
         const item = items.get(row.id) || row;
-        if (item.status === 'failed') { item.status = 'pending'; item.note = ''; }
+        if (item.status === 'failed' && !retryRecords.has(item.id)) { item.status = 'pending'; item.note = ''; }
         restoreItem(item); items.set(item.id, item);
         return item;
       });
@@ -281,6 +354,7 @@
           const owned = unknown.filter(item => states.get(item.id) === true);
           for (const item of owned) { item.status = 'owned'; item.note = '已批量核对：在当前账号素材库中'; }
           await rememberMany(owned);
+          await forgetRetries(owned);
         } catch (e) { if (e.halt) throw e; }
       }
       setQueue(batch.filter(item => item.status === 'pending'));
@@ -288,11 +362,17 @@
       const failure = workers.find(result => result.status === 'rejected');
       if (failure) throw failure.reason;
       if (shouldStop()) return;
-      if (batch.some(item => ['pending', 'processing', 'failed'].includes(item.status))) {
-        setMessage('本页有项目未完成，已保留本页断点。可点“重试失败”继续，不会跳过它们。', true);
+      if (batch.some(item => ['pending', 'processing'].includes(item.status))) {
+        setMessage('本页仍有未处理项目，已保留断点；点击继续入库。', true);
         return;
       }
-      catalog = { version: 1, cursor: page.next || '', pages: catalog.pages + 1, done: page.next === null };
+      const failed = batch.filter(item => item.status === 'failed');
+      if (!await saveRetries(failed)) {
+        setMessage('待重试记录保存失败，已保留本页断点；首项：' + (failed[0]?.note || '存储不可用'), true);
+        return;
+      }
+      if (shouldStop()) return;
+      catalog = { ...catalog, cursor: page.next || '', pages: catalog.pages + 1, done: page.next === null };
       if (progressReady && runCsrf === csrf()) {
         try { await chrome.storage.local.set({ [catalogKey()]: catalog }); }
         catch { progressNotice = '目录断点保存失败；刷新后可能从较早页重新检查，已入库素材不受影响'; }
@@ -315,19 +395,19 @@
   $('#toggle').addEventListener('click', () => open(!expanded));
   ui.addEventListener('keydown', e => { if (e.key === 'Escape') open(false); });
   $('#scan').addEventListener('click', () => catalogMode() ? restartCatalog() : discover(true));
-  $('#start').addEventListener('click', run);
+  $('#start').addEventListener('click', () => run());
   $('#pause').addEventListener('click', () => { stopRequested = true; setMessage('正在暂停，等待已提交项目的状态核对完成…'); });
   $('#clear-memory').addEventListener('click', async () => {
     if (running || !progressReady) return;
     try {
-      await chrome.storage.local.remove([...progress.keys()].map(id => recordPrefix() + id).concat(catalogKey()));
-      progress.clear();
+      await chrome.storage.local.remove([...progress.keys()].map(id => recordPrefix() + id).concat([...retryRecords.keys()].map(id => retryPrefix() + id), catalogKey()));
+      progress.clear(); retryRecords.clear();
       catalog = null; catalogAccount = null;
       for (const item of items.values()) if (['owned', 'claimed'].includes(item.status)) { item.status = 'pending'; item.note = ''; }
       setMessage('已清除当前账号的本地记录。Fab 素材库不受影响；下次开始会重新联网核对。');
     } catch { setMessage('未能清除本地记录，请重新加载扩展后再试。', true); }
   });
-  $('#retry').addEventListener('click', () => { for (const item of items.values()) if (item.status === 'failed') { item.status = 'pending'; item.note = ''; } run(); });
+  $('#retry').addEventListener('click', () => run([...items.values()].filter(item => item.status === 'failed').map(item => item.id)));
   $('#export').addEventListener('click', () => {
     const data = { exportedAt: new Date().toISOString(), page: location.origin + location.pathname,
       results: [...items.values()].map(({ id, name, href, status, note }) => ({ id, name, href, status, note })) };
