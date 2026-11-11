@@ -186,7 +186,7 @@ test('the client does not expose arbitrary endpoints or purchase operations', as
 const tick = () => new Promise(r => setTimeout(r, 15));
 async function uiFixture(t, options = {}) {
   const dom = new JSDOM(options.html || `<main><article><a href="/listings/${A}"><img alt="Basket"></a><h3>Basket</h3><p>From Free</p></article></main>`, {
-    url: 'https://www.fab.com/sellers/fixture', runScripts: 'outside-only', pretendToBeVisual: true
+    url: options.url || 'https://www.fab.com/sellers/fixture', runScripts: 'outside-only', pretendToBeVisual: true
   });
   t.after(() => dom.window.close());
   const w = dom.window;
@@ -204,7 +204,7 @@ async function uiFixture(t, options = {}) {
       if (options.storageWriteError) throw new Error('fixture write failure');
       Object.assign(storage, JSON.parse(JSON.stringify(values)));
     },
-    remove: async keys => { for (const key of keys) delete storage[key]; }
+    remove: async keys => { for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key]; }
   } } };
   w.fetch = async (url, init) => {
     if (url === '/i/users/me') {
@@ -523,4 +523,241 @@ test('a changed login session stops preflight before claiming or caching ownersh
   await until(() => h.shadow.querySelector('#concurrency').disabled === false, 'session change should stop work');
   assert.equal(h.posts, 0);
   assert.equal(Object.keys(h.storage).filter(k => k.startsWith('fabHelperOwned')).length, 0);
+});
+
+const catalogRow = id => ({ uid: id, title: 'Catalogue ' + id, isFree: true, user: { sellerName: 'Quixel Megascans' }, thumbnails: [{ uri: 'https://example.invalid/never-load.jpg' }] });
+const catalogPage = (ids, next = null) => ({ results: ids.map(catalogRow), cursors: { next } });
+const catalogRecord = account => 'fabHelperCatalog_v1_' + account + '_quixel';
+const searchUrl = url => new URL(url, 'https://www.fab.com');
+
+test('catalogue reads validate the seller, identifiers and cursors and retain no thumbnail data', async () => {
+  const client = new Core.Client({ fetch: async url => {
+    const params = searchUrl(url).searchParams;
+    assert.equal(params.get('seller'), 'Quixel Megascans');
+    assert.equal(params.get('is_free'), '1');
+    assert.equal(params.get('count'), '24');
+    assert.equal(params.get('cursor'), 'fixture+/=');
+    return response(catalogPage([A], 'next-page'));
+  } });
+  const page = await client.quixelPage('fixture+/=');
+  assert.equal(page.next, 'next-page');
+  assert.deepEqual(Object.keys(page.items[0]).sort(), ['hint', 'href', 'id', 'name', 'note', 'status']);
+  for (const bad of [
+    { results: [catalogRow(A)], cursors: { next: 'same' } },
+    { results: [catalogRow(A), catalogRow(A)], cursors: { next: null } },
+    { results: [{ ...catalogRow(A), user: { sellerName: 'Another seller' } }], cursors: { next: null } },
+    { results: [{ ...catalogRow(A), uid: 'invalid' }], cursors: { next: null } },
+    { results: [], cursors: { next: 'later' } },
+    { results: [catalogRow(A)] }
+  ]) {
+    const c = new Core.Client({ fetch: async () => response(bad) });
+    await assert.rejects(c.quixelPage('same'), Core.ApiError);
+  }
+});
+
+test('catalogue API additions accept only the fixed free seller query and at most 24 state IDs', async () => {
+  const h = harness();
+  for (const url of [
+    '/i/listings/search?seller=Other&is_free=1&count=24&sort_by=listingTypeWeight',
+    '/i/listings/search?seller=Quixel%20Megascans&is_free=0&count=24&sort_by=listingTypeWeight',
+    '/i/listings/search?seller=Quixel%20Megascans&is_free=1&count=24&sort_by=listingTypeWeight&token=x',
+    '/i/users/me/listings-states?listing_ids=invalid',
+    '/i/users/me/listings-states?' + Array.from({ length: 25 }, () => 'listing_ids=' + A).join('&')
+  ]) await assert.rejects(h.client.request(url), /请求路径/);
+  await assert.rejects(h.client.request('/i/listings/search?seller=Quixel%20Megascans&is_free=1&count=24&sort_by=listingTypeWeight', 'POST'), /请求路径/);
+  assert.equal(h.calls.length, 0);
+});
+
+test('bulk state results keep missing entries unknown and reject unrelated or malformed rows', async () => {
+  const c = new Core.Client({ fetch: async () => response([{ uid: A, acquired: true }]) });
+  const result = await c.states([A, B]);
+  assert.equal(result.get(A), true);
+  assert.equal(result.has(B), false);
+  for (const rows of [[{ uid: C, acquired: true }], [{ uid: A, acquired: 'true' }], [{ uid: A, acquired: true }, { uid: A, acquired: true }], { acquired: true }]) {
+    const bad = new Core.Client({ fetch: async () => response(rows) });
+    await assert.rejects(bad.states([A, B]), /批量拥有状态/);
+  }
+});
+
+test('Quixel seller pages default to a no-scroll catalogue without making requests on load', async t => {
+  const h = await uiFixture(t, { url: 'https://www.fab.com/sellers/Quixel%20Megascans' });
+  assert.equal(h.shadow.querySelector('#scope').value, 'quixel');
+  assert.equal(h.shadow.querySelector('#scroll-option').hidden, true);
+  assert.equal(h.shadow.querySelector('#start').disabled, false);
+  assert.equal(h.scans, 0);
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.identityCalls, 0);
+});
+
+test('catalogue mode streams pages, checks owned batches and claims only new zero-price assets without scrolling', async t => {
+  const acquired = new Set([A, B]);
+  const h = await uiFixture(t, { settings: { scope: 'quixel', scroll: true, concurrency: '32' }, fetch: async (url, init) => {
+    const parsed = searchUrl(url);
+    if (parsed.pathname === '/i/listings/search') return response(parsed.searchParams.has('cursor') ? catalogPage([C]) : catalogPage([A, B], 'second'));
+    if (parsed.pathname === '/i/users/me/listings-states') return response(parsed.searchParams.getAll('listing_ids').map(uid => ({ uid, acquired: acquired.has(uid) })));
+    const id = url.match(/[a-f0-9-]{36}/)[0];
+    if (url.includes('listings-states/')) return response({ acquired: acquired.has(id) });
+    if (init.method === 'POST') { acquired.add(id); return response(null, 204); }
+    return response(url.endsWith('/prices-infos') ? zero : detail);
+  } });
+  let scrolls = 0; h.w.scrollBy = () => scrolls++;
+  h.shadow.querySelector('#start').click();
+  await until(() => h.storage[catalogRecord('fixture-account')]?.done === true && h.shadow.querySelector('#scope').disabled === false, 'catalogue should reach the final page');
+  assert.equal(scrolls, 0);
+  assert.equal(h.scans, 0);
+  assert.equal(h.posts, 1);
+  assert.equal(h.shadow.querySelector('#owned').textContent, '2');
+  assert.equal(h.shadow.querySelector('#claimed').textContent, '1');
+  assert.equal(h.shadow.querySelectorAll('.list img').length, 0);
+  assert.equal(h.calls.filter(c => c.url.includes('/listings/search?')).length, 2);
+  assert.equal(h.calls.filter(c => c.url.includes('/listings-states?')).length, 2);
+  assert.ok(!h.calls.some(c => c.url.endsWith('/listings-states/' + A) || c.url.endsWith('/listings-states/' + B)));
+  assert.equal(h.storage[catalogRecord('fixture-account')].pages, 2);
+});
+
+test('pausing a catalogue page keeps its cursor and reload resumes at that page', async t => {
+  const storage = {};
+  let release, secondStarted = false;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const first = await uiFixture(t, { storage, settings: { scope: 'quixel' }, fetch: async url => {
+    const parsed = searchUrl(url);
+    if (parsed.pathname === '/i/listings/search') {
+      if (parsed.searchParams.has('cursor')) { secondStarted = true; await barrier; return response(catalogPage([B])); }
+      return response(catalogPage([A], 'second'));
+    }
+    return response([{ uid: A, acquired: true }]);
+  } });
+  first.shadow.querySelector('#start').click();
+  try {
+    await until(() => secondStarted, 'the first page must finish and save its next cursor');
+    first.shadow.querySelector('#pause').click();
+  } finally { release(); }
+  await until(() => first.shadow.querySelector('#scope').disabled === false, 'paused request should drain');
+  assert.equal(storage[catalogRecord('fixture-account')].cursor, 'second');
+  assert.equal(storage[catalogRecord('fixture-account')].done, false);
+  const second = await uiFixture(t, { storage, fetch: async url => {
+    const parsed = searchUrl(url);
+    if (parsed.pathname === '/i/listings/search') { assert.equal(parsed.searchParams.get('cursor'), 'second'); return response(catalogPage([B])); }
+    return response([{ uid: B, acquired: true }]);
+  } });
+  second.shadow.querySelector('#start').click();
+  await until(() => second.shadow.querySelector('#scope').disabled === false, 'reload should finish only the resumed page');
+  assert.equal(second.posts, 0);
+  assert.equal(second.calls.filter(c => c.url.includes('/listings/search?')).length, 1);
+  assert.equal(storage[catalogRecord('fixture-account')].pages, 2);
+});
+
+for (const stage of ['directory', 'bulk-state', 'prices']) test(`catalogue ${stage} rate limiting stops before any claim or cursor advance`, async t => {
+  const h = await uiFixture(t, { settings: { scope: 'quixel', concurrency: '32' }, fetch: async url => {
+    const parsed = searchUrl(url);
+    if (parsed.pathname === '/i/listings/search') return response(stage === 'directory' ? {} : catalogPage([A], 'second'), stage === 'directory' ? 429 : 200);
+    if (parsed.pathname === '/i/users/me/listings-states') return response(stage === 'bulk-state' ? {} : [{ uid: A, acquired: false }], stage === 'bulk-state' ? 429 : 200);
+    if (url.includes('listings-states/')) return response({ acquired: false });
+    if (url.endsWith('/prices-infos')) return response({}, 429);
+    return response(detail);
+  } });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'limited work should stop');
+  assert.equal(h.posts, 0);
+  assert.equal(h.storage[catalogRecord('fixture-account')], undefined);
+  assert.match(h.shadow.querySelector('#message').textContent, /限流/);
+  assert.equal(h.calls.filter(c => c.url.includes('/listings/search?')).length, 1);
+});
+
+test('unrecognized bulk states fall back to individual ownership verification', async t => {
+  const h = await uiFixture(t, { settings: { scope: 'quixel' }, fetch: async url => {
+    if (url.includes('/listings/search?')) return response(catalogPage([A]));
+    if (url.includes('/listings-states?')) return response({ unexpected: 'schema' });
+    return response({ acquired: true });
+  } });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'fallback should finish');
+  assert.equal(h.posts, 0);
+  assert.equal(h.calls.filter(c => c.url.endsWith('/listings-states/' + A)).length, 1);
+  assert.equal(h.shadow.querySelector('#owned').textContent, '1');
+});
+
+test('an incomplete page never advances its cursor, and retry safely completes it', async t => {
+  let fail = true, submitted = false;
+  const h = await uiFixture(t, { settings: { scope: 'quixel' }, fetch: async (url, init) => {
+    if (url.includes('/listings/search?')) return response(catalogPage([A]));
+    if (url.includes('/listings-states?')) return response([{ uid: A, acquired: submitted }]);
+    if (url.includes('listings-states/')) return response({ acquired: submitted });
+    if (init.method === 'POST') { submitted = true; return response(null, 204); }
+    if (url.endsWith('/prices-infos')) return response(fail ? {} : zero, fail ? 500 : 200);
+    return response(detail);
+  } });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'failed page should stop');
+  assert.equal(h.storage[catalogRecord('fixture-account')], undefined);
+  assert.equal(h.shadow.querySelector('#failed').textContent, '1');
+  fail = false;
+  h.shadow.querySelector('#retry').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'retry should finish');
+  assert.equal(h.posts, 1);
+  assert.equal(h.storage[catalogRecord('fixture-account')].done, true);
+});
+
+test('catalogue cursors are account-scoped and reset can start over before identity has loaded', async t => {
+  const old = catalogRecord('another-account'), current = catalogRecord('fixture-account');
+  const storage = { [old]: { version: 1, cursor: 'other', pages: 50, done: true }, [current]: { version: 1, cursor: 'finished', pages: 10, done: true }, ['fabHelperOwned_v1_fixture-account_' + A]: { version: 1, status: 'owned' } };
+  const h = await uiFixture(t, { storage, settings: { scope: 'quixel' }, fetch: async url => {
+    assert.ok(url.includes('/listings/search?'));
+    assert.equal(searchUrl(url).searchParams.has('cursor'), false);
+    return response(catalogPage([A]));
+  } });
+  h.shadow.querySelector('#scan').click();
+  await tick();
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'reset should start at page one');
+  assert.equal(h.calls.length, 1);
+  assert.equal(storage[current].pages, 1);
+  assert.equal(storage[old].cursor, 'other');
+  h.shadow.querySelector('#clear-memory').click();
+  await tick();
+  assert.equal(storage[current], undefined);
+  assert.equal(storage['fabHelperOwned_v1_fixture-account_' + A], undefined);
+  assert.equal(storage[old].cursor, 'other');
+  assert.equal(h.posts, 0);
+});
+
+test('hiding library products stops catalogue pagination before it can skip shifting results', async t => {
+  const h = await uiFixture(t, { settings: { scope: 'quixel' }, accountResponse: { uid: 'fixture-account', preferences: { showMyLibraryProducts: false } } });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'unsafe pagination preference should stop');
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.posts, 0);
+  assert.match(h.shadow.querySelector('#message').textContent, /分页移位/);
+});
+
+test('pause during a batch ownership read prevents all following reads and writes', async t => {
+  let release, started = false;
+  const barrier = new Promise(resolve => { release = resolve; });
+  const h = await uiFixture(t, { settings: { scope: 'quixel' }, fetch: async url => {
+    if (url.includes('/listings/search?')) return response(catalogPage([A]));
+    started = true; await barrier;
+    return response([{ uid: A, acquired: false }]);
+  } });
+  h.shadow.querySelector('#start').click();
+  try {
+    await until(() => started, 'bulk read must start');
+    h.shadow.querySelector('#pause').click();
+  } finally { release(); }
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'bulk read should drain');
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.posts, 0);
+  assert.equal(h.storage[catalogRecord('fixture-account')], undefined);
+});
+
+test('a new account starts from page one and never reuses another account catalogue completion', async t => {
+  const storage = { [catalogRecord('fixture-account')]: { version: 1, cursor: 'previous', pages: 100, done: true }, ['fabHelperOwned_v1_fixture-account_' + A]: { version: 1, status: 'owned' } };
+  const h = await uiFixture(t, { storage, account: 'new-account', settings: { scope: 'quixel' }, fetch: async url => {
+    if (url.includes('/listings/search?')) { assert.equal(searchUrl(url).searchParams.has('cursor'), false); return response(catalogPage([A])); }
+    return response([{ uid: A, acquired: true }]);
+  } });
+  h.shadow.querySelector('#start').click();
+  await until(() => h.shadow.querySelector('#scope').disabled === false, 'new account should complete its own directory');
+  assert.equal(h.calls.length, 2);
+  assert.equal(storage[catalogRecord('new-account')].pages, 1);
+  assert.equal(storage[catalogRecord('fixture-account')].pages, 100);
 });

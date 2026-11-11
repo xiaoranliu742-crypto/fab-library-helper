@@ -16,9 +16,17 @@ Object.defineProperty(document, 'cookie', { configurable: true, get: () => 'fab_
 document.addEventListener('click', e => {
  if(e.composedPath().some(n => n.tagName === 'A' && String(n.href).startsWith('https://www.fab.com/'))) e.preventDefault();
 }, true);
-window.chrome = { runtime: { id: 'preview-only', onMessage: { addListener() {} } }, storage: {local: {get: async()=>({}),set:async()=>{}}} };
+const demoStorage = {};
+window.chrome = { runtime: { id: 'preview-only', onMessage: { addListener() {} } }, storage: {local: {
+ get: async key => key === null ? { ...demoStorage } : { [key]: demoStorage[key] },
+ set: async values => Object.assign(demoStorage, values),
+ remove: async keys => { for (const key of Array.isArray(keys) ? keys : [keys]) delete demoStorage[key]; }
+}} };
 window.fetch = async (url, init={}) => {
  if(url === '/i/users/me') return {ok:true,status:200,text:async()=>JSON.stringify({uid:'local-preview'})};
+ const parsed = new URL(url, 'https://www.fab.com');
+ if(parsed.pathname === '/i/listings/search') return {ok:true,status:200,text:async()=>JSON.stringify({results:demoAssets.filter(a=>a[5]===0).map(a=>({uid:a[0],title:a[1],isFree:true,user:{sellerName:'Quixel Megascans'}})),cursors:{next:null}})};
+ if(parsed.pathname === '/i/users/me/listings-states') return {ok:true,status:200,text:async()=>JSON.stringify(parsed.searchParams.getAll('listing_ids').map(uid=>({uid,acquired:demoAssets.find(a=>a[0]===uid)?.[4]===true})))};
  const id = url.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/)?.[0];
  const asset = demoAssets.find(a=>a[0]===id);
  if(!asset) throw new Error('仅支持本地演示素材');

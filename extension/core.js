@@ -82,7 +82,17 @@
     }
     async request(path, method = 'GET', payload) {
       // No arbitrary URLs, payment endpoints, auth tokens or cross-origin requests.
-      if (!/^\/i\/(?:listings\/[a-f0-9-]+(?:\/prices-infos|\/add-to-library)?|users\/me(?:\/listings-states\/[a-f0-9-]+)?)$/i.test(path)) throw new ApiError('请求路径不受支持');
+      const url = new URL(path, 'https://www.fab.com');
+      const params = url.searchParams;
+      const ordinary = !url.search && /^\/i\/(?:listings\/[a-f0-9-]+(?:\/prices-infos|\/add-to-library)?|users\/me(?:\/listings-states\/[a-f0-9-]+)?)$/i.test(path);
+      const catalogue = url.pathname === '/i/listings/search' && params.get('seller') === 'Quixel Megascans' &&
+        params.get('is_free') === '1' && params.get('count') === '24' && params.get('sort_by') === 'listingTypeWeight' &&
+        [...params.keys()].every(key => ['seller', 'is_free', 'count', 'sort_by', 'cursor'].includes(key) && params.getAll(key).length === 1) &&
+        (!params.has('cursor') || (params.get('cursor').length > 0 && params.get('cursor').length <= 2048));
+      const ids = params.getAll('listing_ids');
+      const states = url.pathname === '/i/users/me/listings-states' && ids.length > 0 && ids.length <= 24 &&
+        [...params.keys()].every(key => key === 'listing_ids') && ids.every(id => UID.test(id));
+      if (!path.startsWith('/i/') || url.origin !== 'https://www.fab.com' || url.hash || !(ordinary || (method === 'GET' && (catalogue || states)))) throw new ApiError('请求路径不受支持');
       if (method !== 'GET' && !(method === 'POST' && path.endsWith('/add-to-library'))) throw new ApiError('不支持的操作');
       const headers = { Accept: 'application/json' };
       if (method === 'POST') {
@@ -119,6 +129,7 @@
     }
     async account() {
       const user = await this.request('/i/users/me');
+      this.showMyLibraryProducts = user?.preferences?.showMyLibraryProducts !== false;
       const id = user?.uid ?? user?.id;
       return user?.isAnonymous !== true && typeof id === 'string' && /^[a-z0-9_-]{1,128}$/i.test(id) ? id : null;
     }
@@ -126,6 +137,36 @@
       const result = await this.request('/i/users/me/listings-states/' + id);
       if (typeof result?.acquired !== 'boolean') throw new ApiError('无法核对素材拥有状态，未提交入库');
       return result.acquired;
+    }
+    async quixelPage(cursor = '') {
+      if (typeof cursor !== 'string' || cursor.length > 2048) throw new ApiError('目录断点无法识别');
+      const params = new URLSearchParams({ seller: 'Quixel Megascans', sort_by: 'listingTypeWeight', is_free: '1', count: '24' });
+      if (cursor) params.set('cursor', cursor);
+      const data = await this.request('/i/listings/search?' + params);
+      if (!Array.isArray(data?.results) || data.results.length > 24 || !data.cursors || !('next' in data.cursors)) throw new ApiError('目录结构无法识别，已停止翻页');
+      const next = data.cursors.next;
+      if (next !== null && (typeof next !== 'string' || !next || next.length > 2048 || next === cursor || !data.results.length)) throw new ApiError('目录分页断点异常，已停止翻页');
+      const seen = new Set();
+      const items = data.results.map(row => {
+        if (!UID.test(row?.uid) || typeof row.title !== 'string' || row.user?.sellerName !== 'Quixel Megascans' || seen.has(row.uid.toLowerCase())) throw new ApiError('目录素材或卖家无法核对，已停止翻页');
+        seen.add(row.uid.toLowerCase());
+        return { id: row.uid.toLowerCase(), name: row.title.slice(0, 240), href: 'https://www.fab.com/listings/' + row.uid.toLowerCase(), hint: row.isFree === true ? 'free' : 'unknown', status: 'pending', note: '' };
+      });
+      return { items, next };
+    }
+    async states(ids) {
+      if (!Array.isArray(ids) || !ids.length || ids.length > 24 || !ids.every(id => UID.test(id))) throw new ApiError('批量状态编号无法识别');
+      const params = new URLSearchParams();
+      for (const id of ids) params.append('listing_ids', id);
+      const rows = await this.request('/i/users/me/listings-states?' + params);
+      if (!Array.isArray(rows)) throw new ApiError('批量拥有状态无法识别，将逐项核对');
+      const result = new Map();
+      for (const row of rows) {
+        if (!ids.includes(row?.uid) || typeof row.acquired !== 'boolean' || result.has(row.uid)) throw new ApiError('批量拥有状态无法识别，将逐项核对');
+        result.set(row.uid, row.acquired);
+      }
+      // Missing entries are deliberately left unknown and use individual verification.
+      return result;
     }
     async claim(item, preferred = 'auto', shouldStop = () => false) {
       if (!UID.test(item.id)) throw new ApiError('无效素材编号');

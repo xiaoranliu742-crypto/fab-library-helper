@@ -1,12 +1,21 @@
 {
   "name": "fab-library-helper",
-  "version": "1.4.0",
-  "description": "Fab 免费素材助手：当前网页悬浮面板、零元授权核对和批量入库。",
+  "version": "1.5.0",
+  "description": "Fab 免费素材助手：网页面板、Quixel 全库低内存分页、断点续扫和零元授权入库。",
   "author": "菊山",
-  "repository": { "type": "git", "url": "https://github.com/xiaoranliu742-crypto/fab-library-helper.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xiaoranliu742-crypto/fab-library-helper.git"
+  },
   "private": true,
   "license": "MIT",
-  "engines": { "node": ">=22" },
-  "scripts": { "test": "node --test tests/*.test.cjs" },
-  "devDependencies": { "jsdom": "^26.1.0" }
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.cjs"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
 }

@@ -40,14 +40,15 @@
     <div class="stats"><div class="stat"><div class="num green" id="claimed">0</div><div class="label">已入库</div></div><div class="stat"><div class="num" id="owned">0</div><div class="label">已拥有</div></div><div class="stat"><div class="num" id="skipped">0</div><div class="label">已跳过</div></div><div class="stat"><div class="num amber" id="failed">0</div><div class="label">失败</div></div></div>
     <div class="track" role="progressbar" aria-label="入库进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="fill"></div></div>
     <p class="message" id="message" role="status" aria-live="polite">正在扫描当前网页…</p>
+    <label class="field" style="margin-bottom:12px">处理范围<select id="scope"><option value="page">当前网页 · 扫描卡片</option><option value="quixel">Quixel 全库 · 低内存</option></select></label>
     <div class="settings"><label class="field">领取授权<select id="license"><option value="auto">自动 · 只选零元授权</option><option value="professional">Professional · 专业</option><option value="personal">Personal · 个人</option></select></label>
     <label class="field">领取后间隔<select id="delay"><option value="500">0.5 秒 · 快速</option><option value="1000">1 秒</option><option value="2000">2 秒</option><option value="4000">4 秒</option><option value="8000">8 秒</option></select></label></div>
     <label class="field">同时处理<select id="concurrency"><option value="3">3 项 · 并发快速</option><option value="5">5 项</option><option value="8">8 项</option><option value="16">16 项</option><option value="32">32 项</option><option value="1">1 项 · 串行</option></select></label>
-    <label class="check"><input type="checkbox" id="scroll">自动向下滚动，继续处理新加载的素材</label>
+    <label class="check" id="scroll-option"><input type="checkbox" id="scroll">自动向下滚动，继续处理新加载的素材</label>
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.4.0</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.0</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -57,6 +58,10 @@
   const progressPrefix = 'fabHelperOwned_v1_';
   let progressAccount = null, progressReady = false, progressNotice = '', runCsrf = '';
   let progress = new Map();
+  let catalog = null, catalogAccount = null, catalogTimer, lastCatalogRender = 0, catalogRestart = false;
+  const catalogMode = () => $('#scope').value === 'quixel';
+  const catalogKey = () => 'fabHelperCatalog_v1_' + progressAccount + '_quixel';
+  const freshCatalog = () => ({ version: 1, cursor: '', pages: 0, done: false });
   const labels = { pending: '待核对', processing: '核对中', claimed: '已入库', owned: '已拥有', skipped: '已跳过', failed: '失败' };
   const marks = { pending: '·', processing: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -92,12 +97,17 @@
     } catch { progressNotice = '本地进度读取失败，本轮继续联网核对；已入库素材不受影响'; }
   }
   async function remember(item) {
-    if (!progressReady || runCsrf !== csrf() || !['claimed', 'owned'].includes(item.status)) return;
+    await rememberMany([item]);
+  }
+  async function rememberMany(rows) {
+    if (!progressReady || runCsrf !== csrf()) return;
     // One key per asset avoids rewriting the whole library or losing other tabs' updates.
-    const record = { version: 1, status: item.status, confirmedAt: Date.now() };
+    const saved = {};
+    for (const item of rows) if (['claimed', 'owned'].includes(item.status)) saved[recordPrefix() + item.id] = { version: 1, status: item.status, confirmedAt: Date.now() };
+    if (!Object.keys(saved).length) return;
     try {
-      await chrome.storage.local.set({ [recordPrefix() + item.id]: record });
-      progress.set(item.id, record);
+      await chrome.storage.local.set(saved);
+      for (const item of rows) if (saved[recordPrefix() + item.id]) progress.set(item.id, saved[recordPrefix() + item.id]);
     } catch {
       progressReady = false;
       progressNotice = '本地进度保存失败，刷新后可能需要重新查询；已入库素材仍保存在 Fab';
@@ -105,6 +115,13 @@
   }
 
   function render() {
+    // Keep only text records; coalesce paints while reading a large catalogue.
+    if (running && catalogMode() && $('#scope').disabled && !stopRequested && Date.now() - lastCatalogRender < 100) {
+      if (!catalogTimer) catalogTimer = setTimeout(() => { catalogTimer = null; render(); }, 100);
+      return;
+    }
+    if (catalogTimer) { clearTimeout(catalogTimer); catalogTimer = null; }
+    lastCatalogRender = Date.now();
     const all = [...items.values()];
     const counts = { claimed: 0, owned: 0, skipped: 0, failed: 0 };
     for (const item of all) if (item.status in counts) counts[item.status]++;
@@ -119,21 +136,27 @@
     const pct = all.length ? Math.round(100 * done / all.length) : 0;
     $('.fill').style.width = pct + '%';
     $('.track').setAttribute('aria-valuenow', pct);
-    $('#start').disabled = running || (!all.some(i => i.status === 'pending') && !$('#scroll').checked);
+    $('#start').disabled = running || (catalogMode() ? catalog?.done === true : !all.some(i => i.status === 'pending') && !$('#scroll').checked);
     $('#start').textContent = done ? '继续入库' : '开始入库';
     $('#pause').disabled = !running || stopRequested;
     $('#scan').disabled = running;
     $('#retry').disabled = running || !counts.failed;
     $('#export').disabled = !all.length;
-    $('#clear-memory').disabled = running || !progressReady || !progress.size;
+    $('#clear-memory').disabled = running || !progressReady || (!progress.size && !catalog);
     $('#memory').textContent = progressNotice || (progressReady ? `本地已记住 ${progress.size} 项 · 同账号再次遇到时直接跳过` : '本地进度：开始后自动保存已确认项目');
-    for (const el of [$('#license'), $('#delay'), $('#concurrency'), $('#scroll')]) el.disabled = running;
-    $('#found').textContent = '当前网页 · ' + all.length + ' 项';
+    for (const el of [$('#license'), $('#delay'), $('#concurrency'), $('#scroll'), $('#scope')]) el.disabled = running;
+    $('#scroll-option').hidden = catalogMode();
+    $('#scan').textContent = catalogMode() ? '从头检查' : '重新扫描';
+    $('#found').textContent = catalogMode() ? `整库目录 · 本轮 ${all.length} 项 · 已完成 ${catalog?.pages || 0} 页` : '当前网页 · ' + all.length + ' 项';
     const visible = all.filter(i => i.status === 'processing').concat(all.filter(i => i.status !== 'processing').slice(-60));
     $('#list').innerHTML = visible.length ? visible.map(i => `<div class="row"><span class="mark ${i.status === 'claimed' ? 'green' : ''}">${marks[i.status]}</span><div class="meta"><a class="name" href="${escape(i.href)}" target="_blank" rel="noopener noreferrer" title="${escape(i.name)}">${escape(i.name)}</a><div class="note">${escape(i.note || (i.hint === 'free' ? '网页标记免费 · 入库前再次核对价格' : i.hint === 'owned' ? '网页标记已拥有 · 将核对账号状态' : '将核对价格与拥有状态'))}</div></div><span class="state">${labels[i.status]}</span></div>`).join('') : '<div class="empty">当前页面尚未发现素材卡片。<br>请打开卖家页或搜索结果，等待加载后重新扫描。</div>';
   }
   function setMessage(text, isError = false) { message = text; error = isError; render(); }
   function discover(announce = false) {
+    if (catalogMode()) {
+      if (announce) setMessage('Quixel 全库模式：直接分页读取免费目录，不滚动、不加载缩略图。点击开始后自动保存断点。');
+      return 0;
+    }
     let added = 0;
     for (const item of Core.scan(document)) if (!items.has(item.id)) { restoreItem(item); items.set(item.id, item); added++; }
     if (announce) setMessage(items.size ? `已发现 ${items.size} 项素材。点击开始后会逐项核对价格和拥有状态。` : '没有发现素材链接。请确认当前页面已经加载素材卡片。');
@@ -157,15 +180,17 @@
     running = true; stopRequested = false;
     runCsrf = csrf();
     const preference = $('#license').value, delay = Number($('#delay').value), autoScroll = $('#scroll').checked;
+    const fullCatalog = catalogMode();
     const requested = Number($('#concurrency').value);
     const concurrency = [1, 3, 5, 8, 16, 32].includes(requested) ? requested : 3;
     let emptyRounds = 0;
     discover();
     setMessage(`开始核对当前网页的素材 · 最多同时处理 ${concurrency} 项…`);
+    let queue = [], queueIndex = 0;
     async function worker() {
       while (!shouldStop()) {
         // Reserve synchronously before the first await so workers never claim the same item.
-        const item = [...items.values()].find(i => i.status === 'pending');
+        const item = queue[queueIndex++];
         if (!item) return;
         item.status = 'processing'; item.note = '';
         if (!error) setMessage(`最多同时处理 ${concurrency} 项 · 正在核对：` + item.name);
@@ -185,6 +210,11 @@
       setMessage('正在识别 Fab 账号并恢复本地进度…');
       await loadProgress();
       render();
+      if (fullCatalog) {
+        await runCatalog(concurrency, worker, value => { queue = value; queueIndex = 0; });
+        if (!error) setMessage(shouldStop() ? '已暂停。目录断点和已确认拥有记录会保留；继续时不必滚动回原位置。' : '已到 Quixel 免费目录末尾。本轮处理完成；新上架或价格更新后可点“从头检查”。');
+        return;
+      }
       while (!shouldStop()) {
         let item = [...items.values()].find(i => i.status === 'pending');
         // Re-scan only after the known queue drains, not after every asset.
@@ -199,6 +229,7 @@
           continue;
         }
         emptyRounds = 0;
+        queue = [...items.values()].filter(i => i.status === 'pending'); queueIndex = 0;
         // Drain all workers before scrolling, finishing or starting a new batch.
         const workers = await Promise.allSettled(Array.from({ length: concurrency }, () => worker()));
         const failure = workers.find(result => result.status === 'rejected');
@@ -213,17 +244,85 @@
     }
   }
 
+  async function runCatalog(concurrency, worker, setQueue) {
+    if (client.showMyLibraryProducts === false) throw new Core.ApiError('请先在 Fab 列表的偏好设置中开启“显示素材库中的产品”，再开始整库模式；隐藏已拥有项目会让分页移位而漏项。');
+    if (!progressAccount || catalogRestart || !catalog || catalogAccount !== progressAccount) {
+      if (!progressAccount || catalogAccount !== progressAccount) items.clear();
+      catalog = freshCatalog(); catalogAccount = progressAccount;
+      const reset = catalogRestart; catalogRestart = false;
+      if (progressReady) {
+        try {
+          if (reset) await chrome.storage.local.remove(catalogKey());
+          const saved = (await chrome.storage.local.get(catalogKey()))[catalogKey()];
+          if (saved?.version === 1 && typeof saved.cursor === 'string' && saved.cursor.length <= 2048 && Number.isSafeInteger(saved.pages) && saved.pages >= 0 && typeof saved.done === 'boolean') catalog = { version: 1, cursor: saved.cursor, pages: saved.pages, done: saved.done };
+        } catch { progressNotice = '目录断点读取失败，将从首页检查；已确认拥有记录仍可复用'; }
+      }
+    }
+    const visited = new Set();
+    while (!shouldStop() && !catalog.done) {
+      if (visited.has(catalog.cursor) || visited.size >= 2000) throw new Core.ApiError('目录分页重复或过多，已停止；保留断点以供核查');
+      visited.add(catalog.cursor);
+      setMessage(`正在读取 Quixel 第 ${catalog.pages + 1} 页 · 不加载图片、不滚动网页…`);
+      const page = await client.quixelPage(catalog.cursor);
+      if (shouldStop()) return;
+      const batch = page.items.map(row => {
+        const item = items.get(row.id) || row;
+        if (item.status === 'failed') { item.status = 'pending'; item.note = ''; }
+        restoreItem(item); items.set(item.id, item);
+        return item;
+      });
+      const unknown = batch.filter(item => item.status === 'pending');
+      if (unknown.length) {
+        // Only confirmed true entries skip a claim; all other entries still go
+        // through Client.claim's individual ownership and zero-price preflight.
+        try {
+          const states = await client.states(unknown.map(item => item.id));
+          if (shouldStop()) return;
+          const owned = unknown.filter(item => states.get(item.id) === true);
+          for (const item of owned) { item.status = 'owned'; item.note = '已批量核对：在当前账号素材库中'; }
+          await rememberMany(owned);
+        } catch (e) { if (e.halt) throw e; }
+      }
+      setQueue(batch.filter(item => item.status === 'pending'));
+      const workers = await Promise.allSettled(Array.from({ length: concurrency }, () => worker()));
+      const failure = workers.find(result => result.status === 'rejected');
+      if (failure) throw failure.reason;
+      if (shouldStop()) return;
+      if (batch.some(item => ['pending', 'processing', 'failed'].includes(item.status))) {
+        setMessage('本页有项目未完成，已保留本页断点。可点“重试失败”继续，不会跳过它们。', true);
+        return;
+      }
+      catalog = { version: 1, cursor: page.next || '', pages: catalog.pages + 1, done: page.next === null };
+      if (progressReady && runCsrf === csrf()) {
+        try { await chrome.storage.local.set({ [catalogKey()]: catalog }); }
+        catch { progressNotice = '目录断点保存失败；刷新后可能从较早页重新检查，已入库素材不受影响'; }
+      }
+      render();
+      if (!catalog.done) await waitInterruptibly(500);
+    }
+  }
+
+  async function restartCatalog() {
+    if (running) return;
+    try {
+      if (progressReady) await chrome.storage.local.remove(catalogKey());
+      catalogRestart = true; catalog = null; catalogAccount = null; items.clear();
+      setMessage('目录已从首页重置。已确认拥有记录保留；点击开始后会跳过这些项目。');
+    } catch { setMessage('未能重置目录断点，请重新加载扩展后再试。', true); }
+  }
+
   $('#summary').addEventListener('click', () => open(!expanded));
   $('#toggle').addEventListener('click', () => open(!expanded));
   ui.addEventListener('keydown', e => { if (e.key === 'Escape') open(false); });
-  $('#scan').addEventListener('click', () => discover(true));
+  $('#scan').addEventListener('click', () => catalogMode() ? restartCatalog() : discover(true));
   $('#start').addEventListener('click', run);
   $('#pause').addEventListener('click', () => { stopRequested = true; setMessage('正在暂停，等待已提交项目的状态核对完成…'); });
   $('#clear-memory').addEventListener('click', async () => {
     if (running || !progressReady) return;
     try {
-      await chrome.storage.local.remove([...progress.keys()].map(id => recordPrefix() + id));
+      await chrome.storage.local.remove([...progress.keys()].map(id => recordPrefix() + id).concat(catalogKey()));
       progress.clear();
+      catalog = null; catalogAccount = null;
       for (const item of items.values()) if (['owned', 'claimed'].includes(item.status)) { item.status = 'pending'; item.note = ''; }
       setMessage('已清除当前账号的本地记录。Fab 素材库不受影响；下次开始会重新联网核对。');
     } catch { setMessage('未能清除本地记录，请重新加载扩展后再试。', true); }
@@ -237,14 +336,17 @@
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   });
   async function saveSettings() {
-    try { await chrome.storage.local.set({ fabHelperSettings: { license: $('#license').value, delay: $('#delay').value, concurrency: $('#concurrency').value, scroll: $('#scroll').checked } }); }
+    try { await chrome.storage.local.set({ fabHelperSettings: { license: $('#license').value, delay: $('#delay').value, concurrency: $('#concurrency').value, scroll: $('#scroll').checked, scope: $('#scope').value } }); }
     catch { setMessage('扩展设置未能保存。如刚更新扩展，请刷新网页。', true); }
     render();
   }
   for (const id of ['license', 'delay', 'concurrency', 'scroll']) $('#' + id).addEventListener('change', saveSettings);
+  $('#scope').addEventListener('change', async () => { items.clear(); catalog = null; await saveSettings(); discover(true); render(); });
+  if (/\/sellers\/Quixel%20Megascans(?:\/|$)/i.test(location.pathname)) $('#scope').value = 'quixel';
   try {
     const { fabHelperSettings: saved } = await chrome.storage.local.get('fabHelperSettings');
     if (saved) {
+      if (['page', 'quixel'].includes(saved.scope)) $('#scope').value = saved.scope;
       if (['auto', 'professional', 'personal'].includes(saved.license)) $('#license').value = saved.license;
       if (['500', '1000', '2000', '4000', '8000'].includes(String(saved.delay))) $('#delay').value = String(saved.delay);
       if (['1', '3', '5', '8', '16', '32'].includes(String(saved.concurrency))) $('#concurrency').value = String(saved.concurrency);
@@ -269,7 +371,7 @@
   let scanTimer;
   new MutationObserver(() => {
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(() => { if (!running && !routeDirty) discover(); }, 500);
+    if (!catalogMode()) scanTimer = setTimeout(() => { if (!running && !routeDirty) discover(); }, 500);
   }).observe(document.body, { childList: true, subtree: true });
   setInterval(() => {
     const next = location.pathname + location.search;
