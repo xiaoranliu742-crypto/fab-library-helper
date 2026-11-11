@@ -229,7 +229,7 @@ async function uiFixture(t, options = {}) {
   let scans = 0;
   const scan = w.FabFreeCore.scan;
   const RealRequestGate = w.FabFreeCore.RequestGate;
-  w.FabFreeCore = { ...w.FabFreeCore, RequestGate: RealRequestGate ? class extends RealRequestGate { constructor(config) { super({ ...config, interval: options.requestInterval ?? 0 }); } } : undefined, scan(doc) { scans++; return scan(doc); } };
+  w.FabFreeCore = { ...w.FabFreeCore, RequestGate: RealRequestGate ? class extends RealRequestGate { constructor(config) { super(config); Object.defineProperty(this, 'interval', { get: () => options.requestInterval ?? 0, set: () => {} }); } } : undefined, scan(doc) { scans++; return scan(doc); } };
   w.eval(fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8'));
   await tick();
   const shadow = w.document.getElementById('fab-free-helper-root').shadowRoot;
@@ -612,7 +612,7 @@ test('catalogue mode streams pages, checks owned batches and claims only new zer
   assert.equal(scrolls, 0);
   assert.equal(h.scans, 0);
   assert.equal(h.posts, 1);
-  assert.equal(h.shadow.querySelector('#owned').textContent, '2');
+  assert.equal(h.shadow.querySelector('#owned').textContent, '3');
   assert.equal(h.shadow.querySelector('#claimed').textContent, '1');
   assert.equal(h.shadow.querySelectorAll('.list img').length, 0);
   assert.equal(h.calls.filter(c => c.url.includes('/listings/search?')).length, 2);
@@ -917,7 +917,7 @@ test('an HTTP 400 bundle failure is durable before the next cursor and Continue 
     assert.equal(h.calls.filter(c=>c.url.includes('/listings/search?')).length,1);
   } finally {release();}
   await until(()=>storage[key]?.done && !h.shadow.querySelector('#scope').disabled,'later page should finish despite one failed asset');
-  assert.equal(h.posts,1);
+  assert.equal(h.posts,2);
   assert.equal(h.shadow.querySelector('#claimed').textContent,'0');
   assert.match(storage[retryKey].note,/HTTP 400/);
   assert.equal(h.shadow.querySelector('#owned').textContent,'2');
@@ -929,7 +929,7 @@ test('an HTTP 400 bundle failure is durable before the next cursor and Continue 
   fail=false;
   h.shadow.querySelector('#start').click();
   await until(()=>!h.shadow.querySelector('#scope').disabled,'Continue should retry only unresolved items');
-  assert.equal(h.posts,2);
+  assert.equal(h.posts,3);
   assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
   assert.equal(storage[retryKey],undefined);
   assert.equal(storage[key].pages,2);
@@ -1133,4 +1133,159 @@ test('clearing ownership after 429 does not erase the server cooldown or allow a
   assert.equal(JSON.stringify(storage.fabHelperRateLimit_v1),cooldown);
   assert.equal(h.shadow.querySelector('#start').disabled,true);
   assert.equal(h.calls.length,1);
+});
+
+
+test('owned total includes new claims without double-counting progress, and Continue preserves the new count', async t => {
+  const h=await uiFixture(t);
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'first claim');
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
+  assert.equal(h.shadow.querySelector('#owned').textContent,'1');
+  assert.equal(h.shadow.querySelector('#counter').textContent,'1/1');
+  assert.ok(h.storage['fabHelperOwned_v1_fixture-account_'+A]);
+  h.w.document.querySelector('main').innerHTML=assetGrid([A,B]);
+  h.shadow.querySelector('#scan').click();
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'continue with new row');
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
+  assert.equal(h.shadow.querySelector('#owned').textContent,'2');
+  assert.equal(h.shadow.querySelector('#counter').textContent,'2/2');
+  assert.equal(h.posts,1);
+});
+
+test('fresh bulk unowned results remove only redundant preflight reads and still verify the zero-price claim', async t => {
+  let submitted=false;
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:async(url,init)=>{
+    if(url.includes('/listings/search?'))return response(catalogPage([A]));
+    if(url.includes('/listings-states?'))return response([{uid:A,acquired:false}]);
+    if(url.includes('listings-states/'))return response({acquired:submitted});
+    if(init.method==='POST'){submitted=true;return response(null,204);}
+    return response(url.endsWith('/prices-infos')?zero:detail);
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'fresh bulk page completes');
+  assert.equal(h.posts,1);
+  assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,1);
+  assert.equal(h.calls.filter(c=>c.url.endsWith('/prices-infos')).length,1);
+  assert.equal(h.shadow.querySelector('#owned').textContent,'1');
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
+  assert.equal(h.storage[catalogRecord('fixture-account')].done,true);
+});
+
+test('a competing claim HTTP 400 counts as owned only after a fresh true state, with no second POST', async () => {
+  for(const acquired of [true,false]){
+    let submitted=false,posts=0,reads=0;
+    const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',fetch:async(url,init)=>{
+      if(url.includes('listings-states/')){reads++;return response({acquired:submitted&&acquired});}
+      if(init.method==='POST'){submitted=true;posts++;return response({},400);}
+      return response(url.endsWith('/prices-infos')?zero:detail);
+    }});
+    const result=client.claim(item(),'auto',()=>false,true);
+    if(acquired)assert.equal((await result).status,'owned');
+    else await assert.rejects(result,e=>e.status===400);
+    assert.equal(posts,1);
+    assert.equal(reads,1);
+  }
+});
+
+test('request pace is selectable, browser-local and restored without changing the per-item delay', async t => {
+  const storage={};
+  const h=await uiFixture(t,{storage,settings:{rate:'500',delay:'2000'}});
+  const rate=h.shadow.querySelector('#rate');
+  assert.ok(rate);
+  assert.equal(rate.value,'500');
+  rate.value='1000';rate.dispatchEvent(new h.w.Event('change'));
+  await tick();
+  assert.equal(storage.fabHelperSettings.rate,'1000');
+  assert.equal(storage.fabHelperSettings.delay,'2000');
+  const reloaded=await uiFixture(t,{storage});
+  assert.equal(reloaded.shadow.querySelector('#rate').value,'1000');
+  const other=await uiFixture(t);
+  assert.equal(other.shadow.querySelector('#rate').value,'500');
+  assert.equal(h.identityCalls,0);
+});
+
+test('429 keeps its cooldown and backs the selectable request pace off one step', async t => {
+  const h=await uiFixture(t,{settings:{rate:'500'},fetch:async()=>response({},429)});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'rate-limit drain');
+  assert.equal(h.shadow.querySelector('#rate').value,'1000');
+  assert.equal(h.storage.fabHelperSettings.rate,'1000');
+  assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
+  assert.equal(h.shadow.querySelector('#start').disabled,true);
+  assert.equal(h.posts,0);
+});
+
+test('identical asset titles remain separate by ID while ownership totals count each asset once', async t => {
+  const h=await uiFixture(t,{owned:true,html:assetGrid([A,B]).replaceAll('Asset '+A,'Same title').replaceAll('Asset '+B,'Same title')});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'same-title reads');
+  const links=[...h.shadow.querySelectorAll('.name')];
+  assert.equal(links.length,2);
+  assert.equal(new Set(links.map(a=>a.href)).size,2);
+  assert.ok(links.every(a=>a.textContent==='Same title'));
+  assert.ok(links.every(a=>a.title.includes(a.href.split('/').at(-1))));
+  assert.equal(h.shadow.querySelector('#owned').textContent,'2');
+  assert.equal(h.shadow.querySelector('#counter').textContent,'2/2');
+});
+
+
+test('an ordinary failed free item is automatically rechecked once, then only confirmed success is counted', async t => {
+  let prices=0,submitted=false;
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:async(url,init)=>{
+    if(url.includes('/listings/search?'))return response(catalogPage([A]));
+    if(url.includes('/listings-states?'))return response([{uid:A,acquired:false}]);
+    if(url.includes('listings-states/'))return response({acquired:submitted});
+    if(init.method==='POST'){submitted=true;return response(null,204);}
+    if(url.endsWith('/prices-infos'))return ++prices===1?response({},500):response(zero);
+    return response(detail);
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'ordinary error should recover automatically');
+  assert.equal(prices,2);
+  assert.equal(h.posts,1);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
+  assert.equal(h.shadow.querySelector('#owned').textContent,'1');
+  assert.equal(h.shadow.querySelector('#failed').textContent,'0');
+  assert.ok(h.storage['fabHelperOwned_v1_fixture-account_'+A]);
+  assert.equal(h.storage[retryRecord('fixture-account',A)],undefined);
+});
+
+test('a persisted failure encountered during catalogue scanning is automatically rechecked rather than skipped', async t => {
+  const retryKey=retryRecord('fixture-account',A),storage={[retryKey]:{version:1,name:'Old failed free asset',note:'HTTP 500'}};
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'},fetch:async url=>url.includes('/listings/search?')?response(catalogPage([A])):response([{uid:A,acquired:true}])});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'saved failure should be rechecked');
+  assert.equal(h.shadow.querySelector('#owned').textContent,'1');
+  assert.equal(h.shadow.querySelector('#failed').textContent,'0');
+  assert.equal(storage[retryKey],undefined);
+  assert.equal(h.posts,0);
+});
+
+test('pause during automatic failure backoff cancels the retry and retains the current catalogue page', async t => {
+  let prices=0;
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:async url=>{
+    if(url.includes('/listings/search?'))return response(catalogPage([A]));
+    if(url.includes('/listings-states?'))return response([{uid:A,acquired:false}]);
+    if(url.endsWith('/prices-infos')){prices++;return response({},500);}
+    return response(detail);
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>h.shadow.querySelector('.note')?.textContent.includes('自动复核'),'automatic retry wait');
+  h.shadow.querySelector('#pause').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'pause should cancel retry');
+  assert.equal(prices,1);
+  assert.equal(h.posts,0);
+  assert.equal(h.storage[catalogRecord('fixture-account')],undefined);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+});
+
+
+test('reusing a fresh unowned batch result never skips price checks or submits a paid offer', async () => {
+  const h=harness({prices:{offers:[{offerId:'paid',price:9}]}});
+  assert.equal((await h.client.claim(item(),'auto',()=>false,true)).status,'skipped');
+  assert.equal(h.writes,0);
+  assert.equal(h.calls.filter(c=>c.url.includes('listings-states')).length,0);
+  assert.equal(h.calls.filter(c=>c.url.endsWith('/prices-infos')).length,1);
 });

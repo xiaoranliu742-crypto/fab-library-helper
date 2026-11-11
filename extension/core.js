@@ -212,11 +212,11 @@
       // Missing entries are deliberately left unknown and use individual verification.
       return result;
     }
-    async claim(item, preferred = 'auto', shouldStop = () => false) {
+    async claim(item, preferred = 'auto', shouldStop = () => false, knownUnowned = false) {
       if (!UID.test(item.id)) throw new ApiError('无效素材编号');
       const checkpoint = () => { if (shouldStop()) throw new Paused(); };
       checkpoint();
-      if (await this.state(item.id)) return { status: 'owned', note: '已在当前账号素材库中' };
+      if (knownUnowned !== true && await this.state(item.id)) return { status: 'owned', note: '已在当前账号素材库中' };
       checkpoint();
       // These are independent reads. Wait for both, including failures, before a write or next item.
       const reads = await Promise.allSettled([
@@ -231,7 +231,17 @@
       const offer = selectOffer(detail, prices, preferred);
       if (!offer) return { status: 'skipped', note: '没有核对到零元授权，已跳过' };
       checkpoint();
-      await this.request('/i/listings/' + item.id + '/add-to-library', 'POST', { offerId: offer.offerId });
+      try {
+        await this.request('/i/listings/' + item.id + '/add-to-library', 'POST', { offerId: offer.offerId });
+      } catch (error) {
+        // Another tab/browser may have claimed since the batch read. A 400 alone is never success.
+        if (error.status === 400) {
+          try {
+            if (await this.state(item.id, true)) return { status: 'owned', note: '提交时已拥有 · 已重新核对当前账号状态' };
+          } catch (verification) { if (verification.halt) throw verification; }
+        }
+        throw error;
+      }
       // A POST, closed dialog or disabled button is not proof of ownership.
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt) await this.sleep(1000 * attempt);

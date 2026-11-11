@@ -37,19 +37,20 @@
     <button class="summary" id="summary" aria-expanded="true" aria-controls="body">Fab 免费素材助手</button>
     <span class="count" id="counter">0/0</span><button class="icon" id="toggle" aria-label="收起面板" aria-expanded="true" aria-controls="body">⌃</button></header>
     <div class="body" id="body"><div class="heading"><h1>免费素材，一键入库</h1><span class="badge">FAB</span></div>
-    <div class="stats"><div class="stat"><div class="num green" id="claimed">0</div><div class="label">已入库</div></div><div class="stat"><div class="num" id="owned">0</div><div class="label">已拥有</div></div><div class="stat"><div class="num" id="skipped">0</div><div class="label">已跳过</div></div><div class="stat"><div class="num amber" id="failed">0</div><div class="label">失败</div></div></div>
+    <div class="stats"><div class="stat"><div class="num green" id="claimed">0</div><div class="label">本轮新增</div></div><div class="stat"><div class="num" id="owned">0</div><div class="label" title="本页已确认拥有，包含本轮新增；同一素材编号只计一次">已拥有总计</div></div><div class="stat"><div class="num" id="skipped">0</div><div class="label">已跳过</div></div><div class="stat"><div class="num amber" id="failed">0</div><div class="label">失败</div></div></div>
     <div class="track" role="progressbar" aria-label="入库进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="fill"></div></div>
     <p class="message" id="message" role="status" aria-live="polite">正在扫描当前网页…</p>
     <label class="field" style="margin-bottom:12px">处理范围<select id="scope"><option value="page">当前网页 · 扫描卡片</option><option value="quixel">Quixel 全库 · 低内存</option></select></label>
     <div class="settings"><label class="field">领取授权<select id="license"><option value="auto">自动 · 只选零元授权</option><option value="professional">Professional · 专业</option><option value="personal">Personal · 个人</option></select></label>
     <label class="field">领取后间隔<select id="delay"><option value="500">0.5 秒 · 快速</option><option value="1000">1 秒</option><option value="2000">2 秒</option><option value="4000">4 秒</option><option value="8000">8 秒</option></select></label></div>
     <label class="field">同时处理<select id="concurrency"><option value="3">3 项 · 并发快速</option><option value="5">5 项</option><option value="8">8 项</option><option value="16">16 项</option><option value="32">32 项</option><option value="1">1 项 · 串行</option></select></label>
-    <p class="rate-hint">本页所有插件请求至少间隔 1 秒；领取后间隔另计。</p>
+    <label class="field" style="margin-top:10px">请求间隔<select id="rate"><option value="500">0.5 秒 · 均衡</option><option value="1000">1 秒 · 稳妥</option><option value="2000">2 秒 · 慢速</option></select></label>
+    <p class="rate-hint" id="rate-hint"></p>
     <label class="check" id="scroll-option"><input type="checkbox" id="scroll">自动向下滚动，继续处理新加载的素材</label>
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.3</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.4</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -67,7 +68,7 @@
   const labels = { pending: '待核对', processing: '核对中', claimed: '已入库', owned: '已拥有', skipped: '已跳过', failed: '失败' };
   const marks = { pending: '·', processing: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const requestGate = new Core.RequestGate({ interval: 1000 });
+  const requestGate = new Core.RequestGate({ interval: 500 });
   const cooldownKey = 'fabHelperRateLimit_v1';
   let cooldownTimer;
   async function loadCooldown() {
@@ -83,6 +84,9 @@
       if (e.status === 429) requestGate.blockUntil(e.retryAt || Date.now() + 60000);
       setMessage(e.message, true);
       if (e.status === 429) {
+        $('#rate').value = String(Math.min(2000, Number($('#rate').value) * 2));
+        requestGate.interval = Number($('#rate').value);
+        await saveSettings();
         try { await chrome.storage.local.set({ [cooldownKey]: { version: 1, until: requestGate.cooldownUntil } }); }
         catch { setMessage(e.message + '；冷却记录保存失败，请保持本页打开。', true); }
       }
@@ -93,7 +97,7 @@
   const recordPrefix = () => progressPrefix + progressAccount + '_';
   const retryPrefix = () => 'fabHelperRetry_v1_' + progressAccount + '_';
   function restoreItem(item) {
-    if (progressReady && progress.has(item.id)) {
+    if (progressReady && progress.has(item.id) && item.status !== 'claimed') {
       item.status = 'owned'; item.note = '本地记录：此前已确认拥有 · 已跳过网络查询';
     }
   }
@@ -181,7 +185,9 @@
     const counts = { claimed: 0, owned: 0, skipped: 0, failed: 0 };
     for (const item of all) if (item.status in counts) counts[item.status]++;
     const done = Object.values(counts).reduce((a, b) => a + b, 0);
-    for (const key of Object.keys(counts)) $('#' + key).textContent = counts[key];
+    const displayed = { ...counts, owned: counts.owned + counts.claimed };
+    for (const key of Object.keys(displayed)) $('#' + key).textContent = displayed[key];
+    $('#rate-hint').textContent = '本页请求至少间隔 ' + Number($('#rate').value) / 1000 + ' 秒；限流后自动调慢，领取后间隔另计。';
     $('#counter').textContent = done + '/' + all.length;
     const active = all.filter(i => i.status === 'processing').length;
     $('#summary').textContent = running ? (stopRequested ? '正在暂停 · 等待当前结果' : '正在入库 · ' + active + ' 项处理中 · ' + counts.claimed + ' 项成功') : 'Fab 助手 · ' + (done ? '已入库 ' + counts.claimed + ' 项' : '发现 ' + all.length + ' 项素材');
@@ -202,14 +208,14 @@
     $('#export').disabled = !all.length;
     $('#clear-memory').disabled = running || !progressReady || (!progress.size && !catalog);
     $('#memory').textContent = browserLabel + ' · ' + (progressReady ? `本地已记住 ${progress.size} 项 · ${progressNotice || '同账号再次遇到时直接跳过'}` : progressNotice || '本地进度：开始后自动保存已确认项目');
-    for (const el of [$('#license'), $('#delay'), $('#concurrency'), $('#scroll'), $('#scope')]) el.disabled = running;
+    for (const el of [$('#license'), $('#delay'), $('#rate'), $('#concurrency'), $('#scroll'), $('#scope')]) el.disabled = running;
     $('#scroll-option').hidden = catalogMode();
     $('#scan').textContent = catalogMode() ? '从头检查' : '重新扫描';
     $('#found').textContent = catalogMode() ? `整库目录 · 本轮 ${all.length} 项 · 已完成 ${catalog?.pages || 0} 页` : '当前网页 · ' + all.length + ' 项';
     const priority = all.filter(i => i.status === 'processing').concat(all.filter(i => i.status === 'failed')).slice(0, 60);
     const room = 60 - priority.length;
     const visible = priority.concat(room > 0 ? all.filter(i => !['processing', 'failed'].includes(i.status)).slice(-room) : []);
-    $('#list').innerHTML = visible.length ? visible.map(i => `<div class="row"><span class="mark ${i.status === 'claimed' ? 'green' : ''}">${marks[i.status]}</span><div class="meta"><a class="name" href="${escape(i.href)}" target="_blank" rel="noopener noreferrer" title="${escape(i.name)}">${escape(i.name)}</a><div class="note">${escape(i.note || (i.hint === 'free' ? '网页标记免费 · 入库前再次核对价格' : i.hint === 'owned' ? '网页标记已拥有 · 将核对账号状态' : '将核对价格与拥有状态'))}</div></div><span class="state">${labels[i.status]}</span></div>`).join('') : '<div class="empty">当前页面尚未发现素材卡片。<br>请打开卖家页或搜索结果，等待加载后重新扫描。</div>';
+    $('#list').innerHTML = visible.length ? visible.map(i => `<div class="row"><span class="mark ${i.status === 'claimed' ? 'green' : ''}">${marks[i.status]}</span><div class="meta"><a class="name" href="${escape(i.href)}" target="_blank" rel="noopener noreferrer" title="${escape(i.name)} · ${escape(i.id)}">${escape(i.name)}</a><div class="note">${escape(i.note || (i.hint === 'free' ? '网页标记免费 · 入库前再次核对价格' : i.hint === 'owned' ? '网页标记已拥有 · 将核对账号状态' : '将核对价格与拥有状态'))}</div></div><span class="state">${labels[i.status]}</span></div>`).join('') : '<div class="empty">当前页面尚未发现素材卡片。<br>请打开卖家页或搜索结果，等待加载后重新扫描。</div>';
   }
   function setMessage(text, isError = false) { message = text; error = isError; render(); }
   function discover(announce = false) {
@@ -249,7 +255,7 @@
     let emptyRounds = 0;
     discover();
     setMessage(`开始核对当前网页的素材 · 最多同时处理 ${concurrency} 项…`);
-    let queue = [], queueIndex = 0;
+    let queue = [], queueIndex = 0, checkedUnowned = new Set();
     async function worker() {
       while (!shouldStop()) {
         // Reserve synchronously before the first await so workers never claim the same item.
@@ -257,14 +263,24 @@
         if (!item) return;
         item.status = 'processing'; item.note = '';
         if (!error) setMessage(`最多同时处理 ${concurrency} 项 · 正在核对：` + item.name);
-        try {
-          Object.assign(item, await client.claim(item, preference, shouldStop));
-          await remember(item);
-          await forgetRetries([item]);
-        } catch (e) {
-          if (e instanceof Core.Paused) { item.status = 'pending'; render(); return; }
-          item.status = 'failed'; item.note = e.message;
-          if (e.halt) { stopRequested = true; setMessage(e.message, true); }
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            Object.assign(item, await client.claim(item, preference, shouldStop, attempt === 0 && checkedUnowned.has(item.id)));
+            await remember(item);
+            await forgetRetries([item]);
+            break;
+          } catch (e) {
+            if (e instanceof Core.Paused) { item.status = 'pending'; render(); return; }
+            if (!e.halt && attempt === 0) {
+              item.note = e.message + ' · 1.5 秒后自动复核一次'; render();
+              await waitInterruptibly(1500);
+              if (shouldStop()) { item.status = 'pending'; render(); return; }
+              continue;
+            }
+            item.status = 'failed'; item.note = e.message;
+            if (e.halt) { stopRequested = true; setMessage(e.message, true); }
+            break;
+          }
         }
         render();
         await waitInterruptibly(['owned', 'skipped'].includes(item.status) ? Math.min(delay, 100) : delay);
@@ -299,7 +315,7 @@
         return;
       }
       if (fullCatalog) {
-        await runCatalog(concurrency, worker, value => { queue = value; queueIndex = 0; });
+        await runCatalog(concurrency, worker, (value, unowned = []) => { queue = value; queueIndex = 0; checkedUnowned = new Set(unowned); });
         const failed = [...items.values()].filter(item => item.status === 'failed');
         if (!error) setMessage(shouldStop() ? '已暂停。目录断点和已确认拥有记录会保留；继续时不必滚动回原位置。' : failed.length ? '目录读取完毕，仍有 ' + failed.length + ' 项待重试。首项：' + failed[0].note + '；点击“重试失败”单独处理。' : '已到 Quixel 免费目录末尾。本轮处理完成；新上架或价格更新后可点“从头检查”。', !shouldStop() && failed.length > 0);
         return;
@@ -363,24 +379,26 @@
       if (shouldStop()) return;
       const batch = page.items.map(row => {
         const item = items.get(row.id) || row;
-        if (item.status === 'failed' && !retryRecords.has(item.id)) { item.status = 'pending'; item.note = ''; }
+        if (item.status === 'failed') { item.status = 'pending'; item.note = ''; }
         restoreItem(item); items.set(item.id, item);
         return item;
       });
       const unknown = batch.filter(item => item.status === 'pending');
+      let checkedUnowned = [];
       if (unknown.length) {
-        // Only confirmed true entries skip a claim; all other entries still go
-        // through Client.claim's individual ownership and zero-price preflight.
+        // Reuse this page's strict boolean results only within this batch.
+        // Missing/malformed states and retries still perform individual reads.
         try {
           const states = await client.states(unknown.map(item => item.id));
           if (shouldStop()) return;
+          checkedUnowned = unknown.filter(item => states.get(item.id) === false).map(item => item.id);
           const owned = unknown.filter(item => states.get(item.id) === true);
           for (const item of owned) { item.status = 'owned'; item.note = '已批量核对：在当前账号素材库中'; }
           await rememberMany(owned);
           await forgetRetries(owned);
         } catch (e) { if (e.halt) throw e; }
       }
-      setQueue(batch.filter(item => item.status === 'pending'));
+      setQueue(batch.filter(item => item.status === 'pending'), checkedUnowned);
       const workers = await Promise.allSettled(Array.from({ length: concurrency }, () => worker()));
       const failure = workers.find(result => result.status === 'rejected');
       if (failure) throw failure.reason;
@@ -439,11 +457,12 @@
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   });
   async function saveSettings() {
-    try { await chrome.storage.local.set({ fabHelperSettings: { license: $('#license').value, delay: $('#delay').value, concurrency: $('#concurrency').value, scroll: $('#scroll').checked, scope: $('#scope').value } }); }
+    try { await chrome.storage.local.set({ fabHelperSettings: { license: $('#license').value, delay: $('#delay').value, rate: $('#rate').value, concurrency: $('#concurrency').value, scroll: $('#scroll').checked, scope: $('#scope').value } }); }
     catch { setMessage('扩展设置未能保存。如刚更新扩展，请刷新网页。', true); }
     render();
   }
-  for (const id of ['license', 'delay', 'concurrency', 'scroll']) $('#' + id).addEventListener('change', saveSettings);
+  for (const id of ['license', 'delay', 'rate', 'concurrency', 'scroll']) $('#' + id).addEventListener('change', saveSettings);
+  $('#rate').addEventListener('change', () => { requestGate.interval = Number($('#rate').value); });
   $('#scope').addEventListener('change', async () => { items.clear(); catalog = null; await saveSettings(); discover(true); render(); });
   if (/\/sellers\/Quixel%20Megascans(?:\/|$)/i.test(location.pathname)) $('#scope').value = 'quixel';
   try {
@@ -452,10 +471,12 @@
       if (['page', 'quixel'].includes(saved.scope)) $('#scope').value = saved.scope;
       if (['auto', 'professional', 'personal'].includes(saved.license)) $('#license').value = saved.license;
       if (['500', '1000', '2000', '4000', '8000'].includes(String(saved.delay))) $('#delay').value = String(saved.delay);
+      if (['500', '1000', '2000'].includes(String(saved.rate))) $('#rate').value = String(saved.rate);
       if (['1', '3', '5', '8', '16', '32'].includes(String(saved.concurrency))) $('#concurrency').value = String(saved.concurrency);
       $('#scroll').checked = saved.scroll === true;
     }
   } catch { /* Defaults work even if local settings are unavailable. */ }
+  requestGate.interval = Number($('#rate').value);
   await loadCooldown();
   chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (msg?.type === 'FAB_HELPER_OPEN') { open(true); respond({ ok: true }); }
