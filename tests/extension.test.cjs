@@ -228,7 +228,8 @@ async function uiFixture(t, options = {}) {
   w.eval(fs.readFileSync(path.join(__dirname, '../extension/core.js'), 'utf8'));
   let scans = 0;
   const scan = w.FabFreeCore.scan;
-  w.FabFreeCore = { ...w.FabFreeCore, scan(doc) { scans++; return scan(doc); } };
+  const RealRequestGate = w.FabFreeCore.RequestGate;
+  w.FabFreeCore = { ...w.FabFreeCore, RequestGate: RealRequestGate ? class extends RealRequestGate { constructor(config) { super({ ...config, interval: options.requestInterval ?? 0 }); } } : undefined, scan(doc) { scans++; return scan(doc); } };
   w.eval(fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8'));
   await tick();
   const shadow = w.document.getElementById('fab-free-helper-root').shadowRoot;
@@ -1049,4 +1050,87 @@ test('changing accounts before a retry never uses the old failures and leaves St
   assert.equal(storage[key].pages,3);
   assert.ok(storage[retryKey]);
   assert.equal(h.posts,0);
+});
+
+
+test('a single gate spaces every request start, including reads and submission confirmation', async () => {
+  const gate=new Core.RequestGate({interval:20});
+  const starts=[];
+  const client=new Core.Client({beforeRequest:()=>gate.wait(),fetch:async()=>{starts.push(Date.now());return response({});}});
+  await Promise.all([client.request('/i/users/me'),client.request('/i/listings/'+A),client.request('/i/listings/'+A+'/prices-infos'),client.request('/i/users/me/listings-states/'+A,'GET',undefined,{afterSubmission:true})]);
+  assert.equal(starts.length,4);
+  for(let i=1;i<starts.length;i++)assert.ok(starts[i]-starts[i-1]>=20,'requests must not burst together');
+});
+
+test('429 cancels queued requests before fetch and never dispatches the queued POST', async () => {
+  const gate=new Core.RequestGate({interval:20});
+  let stopped=false;const methods=[];
+  const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',beforeRequest:()=>gate.wait(()=>stopped),onHalt:e=>{stopped=true;gate.blockUntil(e.retryAt);},fetch:async(url,init)=>{methods.push(init.method);return response({},429);}});
+  const results=await Promise.allSettled([client.request('/i/users/me'),client.request('/i/listings/'+A+'/add-to-library','POST',{offerId:'fixture'})]);
+  assert.equal(results[0].reason.status,429);
+  assert.ok(results[1].reason instanceof Core.Paused);
+  assert.deepEqual(methods,['GET']);
+});
+
+test('429 honors Retry-After seconds and HTTP dates, with an explicit fallback when absent', async () => {
+  const now=Date.UTC(2026,10,11,12,0,0);
+  for(const [header,ms] of [['90',90000],[new Date(now+120000).toUTCString(),120000],[null,60000]]){
+    const client=new Core.Client({now:()=>now,fetch:async()=>({...response({},429),headers:{get:name=>name.toLowerCase()==='retry-after'?header:null}})});
+    await assert.rejects(client.account(),e=>e.status===429&&e.retryAt===now+ms&&/冷却/.test(e.message));
+  }
+});
+
+test('a submitted claim can still confirm during a manual pause through the request gate', async () => {
+  let stopped=false,submitted=false;const roles=[];
+  const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',beforeRequest:async role=>{roles.push(role.afterSubmission===true);if(stopped&&!role.afterSubmission)throw new Core.Paused();},fetch:async(url,init)=>{
+    if(url.includes('listings-states'))return response({acquired:submitted});
+    if(init.method==='POST'){submitted=true;stopped=true;return response(null,204);}
+    return response(url.endsWith('/prices-infos')?zero:detail);
+  }});
+  assert.equal((await client.claim(item(),'auto',()=>stopped)).status,'claimed');
+  assert.deepEqual(roles,[false,false,false,false,true]);
+});
+
+test('browser-local cooldown survives reload, expires without auto-running and is not shared with another store', async t => {
+  const untilAt=Date.now()+60000;
+  const storage={fabHelperRateLimit_v1:{version:1,until:untilAt}};
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'}});
+  assert.equal(h.shadow.querySelector('#start').disabled,true);
+  assert.match(h.shadow.querySelector('#start').textContent,/冷却/);
+  h.shadow.querySelector('#start').click();
+  assert.equal(h.identityCalls,0);
+  assert.equal(h.calls.length,0);
+  const other=await uiFixture(t,{settings:{scope:'quixel'}});
+  assert.equal(other.shadow.querySelector('#start').disabled,false);
+  const originalNow=Date.now;
+  h.w.Date.now=()=>originalNow()+61000;
+  await until(()=>!h.shadow.querySelector('#start').disabled,'expired cooldown should reenable manual Start');
+  assert.equal(h.identityCalls,0);
+  assert.equal(h.calls.length,0);
+});
+
+test('a paced 429 pauses queued workers without marking unrequested assets failed', async t => {
+  const h=await uiFixture(t,{html:assetGrid([A,B]),requestInterval:20,settings:{concurrency:'3'},fetch:async()=>response({},429)});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#concurrency').disabled,'limited work should drain');
+  assert.equal(h.calls.length,1);
+  assert.equal(h.posts,0);
+  assert.equal(h.shadow.querySelector('#failed').textContent,'1');
+  assert.equal([...h.shadow.querySelectorAll('.state')].filter(e=>e.textContent==='待核对').length,1);
+  assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
+  assert.equal(h.shadow.querySelector('#start').disabled,true);
+});
+
+test('clearing ownership after 429 does not erase the server cooldown or allow another request', async t => {
+  const storage={['fabHelperOwned_v1_fixture-account_'+A]:{version:1,status:'owned'}};
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'},fetch:async()=>response({},429)});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'directory 429 should pause');
+  const cooldown=JSON.stringify(storage.fabHelperRateLimit_v1);
+  assert.ok(storage.fabHelperRateLimit_v1?.until>Date.now());
+  h.shadow.querySelector('#clear-memory').click();
+  await tick();
+  assert.equal(JSON.stringify(storage.fabHelperRateLimit_v1),cooldown);
+  assert.equal(h.shadow.querySelector('#start').disabled,true);
+  assert.equal(h.calls.length,1);
 });

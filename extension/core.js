@@ -76,11 +76,43 @@
     return { ...chosen, license: slugOf(licenses.find(l => l.offerId === chosen.offerId) || {}) || '零元授权' };
   }
 
-  class Client {
-    constructor({ fetch, cookie = () => '', sleep = ms => new Promise(r => setTimeout(r, ms)), onHalt = () => {} }) {
-      this.fetch = fetch; this.cookie = cookie; this.sleep = sleep; this.onHalt = onHalt;
+  // Reserve request starts across all workers; waiting never consumes a network timeout.
+  class RequestGate {
+    constructor({ interval = 1000, now = () => Date.now(), sleep = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
+      this.interval = interval; this.now = now; this.sleep = sleep;
+      this.nextAt = 0; this.cooldownUntil = 0; this.queue = Promise.resolve();
     }
-    async request(path, method = 'GET', payload) {
+    blockUntil(until) { if (Number.isFinite(until)) this.cooldownUntil = Math.max(this.cooldownUntil, until); }
+    async wait(shouldStop = () => false) {
+      const previous = this.queue;
+      let release;
+      this.queue = new Promise(resolve => { release = resolve; });
+      await previous;
+      const check = () => {
+        if (shouldStop()) throw new Paused();
+        if (this.cooldownUntil > this.now()) {
+          const error = new ApiError('Fab 请求限流，冷却 ' + Math.ceil((this.cooldownUntil - this.now()) / 1000) + ' 秒后可手动继续', 429);
+          error.retryAt = this.cooldownUntil;
+          throw error;
+        }
+      };
+      try {
+        check();
+        while (this.now() < this.nextAt) {
+          await this.sleep(Math.min(100, this.nextAt - this.now()));
+          check();
+        }
+        this.nextAt = this.now() + this.interval;
+      } finally { release(); }
+    }
+  }
+
+  class Client {
+    constructor({ fetch, cookie = () => '', sleep = ms => new Promise(r => setTimeout(r, ms)), onHalt = () => {}, beforeRequest = async () => {}, now = () => Date.now() }) {
+      this.fetch = fetch; this.cookie = cookie; this.sleep = sleep; this.onHalt = onHalt;
+      this.beforeRequest = beforeRequest; this.now = now;
+    }
+    async request(path, method = 'GET', payload, options = {}) {
       // No arbitrary URLs, payment endpoints, auth tokens or cross-origin requests.
       const url = new URL(path, 'https://www.fab.com');
       const params = url.searchParams;
@@ -99,21 +131,31 @@
         const token = this.cookie().match(/(?:^|;\s*)fab_csrftoken=([^;]+)/)?.[1];
         if (!token) {
           const error = new ApiError('缺少网页验证信息。请在 Fab 手动领取一项免费素材并完成授权后重试', 403);
-          this.onHalt(error);
+          await this.onHalt(error);
           throw error;
         }
         headers['X-CSRFToken'] = token;
         headers['Content-Type'] = 'application/json';
       }
+      await this.beforeRequest(options);
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 20000);
       try {
         const response = await this.fetch(path, { method, credentials: 'include', redirect: 'error', headers,
           signal: controller.signal, ...(payload ? { body: JSON.stringify(payload) } : {}) });
         if (!response.ok) {
+          if (response.status === 429) {
+            const now = this.now(), value = response.headers?.get('Retry-After')?.trim();
+            const parsed = value && /^\d+$/.test(value) ? now + Number(value) * 1000 : value ? Date.parse(value) : NaN;
+            // Without a usable server value, 60 seconds is our conservative local fallback.
+            const retryAt = Number.isFinite(parsed) ? Math.max(now + 1000, parsed) : now + 60000;
+            const error = new ApiError('Fab 请求限流，冷却 ' + Math.ceil((retryAt - now) / 1000) + ' 秒后可手动继续', 429);
+            error.retryAt = retryAt;
+            throw error;
+          }
           const message = response.status === 401 ? '请先在当前浏览器登录 Fab' :
             response.status === 403 ? '网页验证或授权尚未完成，请手动领取一项免费素材后重试' :
-            response.status === 429 ? 'Fab 请求限流，已暂停。请稍后再继续' : `Fab 返回 HTTP ${response.status}，本项未确认成功`;
+            `Fab 返回 HTTP ${response.status}，本项未确认成功`;
           throw new ApiError(message, response.status);
         }
         const body = await response.text();
@@ -121,7 +163,7 @@
         try { return JSON.parse(body); } catch { throw new ApiError('Fab 返回了非 JSON 页面，可能需要重新登录或完成网页验证', 403); }
       } catch (error) {
         if (error instanceof ApiError) {
-          if (error.halt) this.onHalt(error);
+          if (error.halt) await this.onHalt(error);
           throw error;
         }
         throw new ApiError(error.name === 'AbortError' ? '请求超时；如已提交入库，重试时会先核对拥有状态' : '网络请求失败，请检查网络或网页验证状态');
@@ -133,8 +175,8 @@
       const id = user?.uid ?? user?.id;
       return user?.isAnonymous !== true && typeof id === 'string' && /^[a-z0-9_-]{1,128}$/i.test(id) ? id : null;
     }
-    async state(id) {
-      const result = await this.request('/i/users/me/listings-states/' + id);
+    async state(id, afterSubmission = false) {
+      const result = await this.request('/i/users/me/listings-states/' + id, 'GET', undefined, { afterSubmission });
       if (typeof result?.acquired !== 'boolean') throw new ApiError('无法核对素材拥有状态，未提交入库');
       return result.acquired;
     }
@@ -193,12 +235,12 @@
       // A POST, closed dialog or disabled button is not proof of ownership.
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt) await this.sleep(1000 * attempt);
-        if (await this.state(item.id)) return { status: 'claimed', note: '已确认入库 · ' + offer.license };
+        if (await this.state(item.id, true)) return { status: 'claimed', note: '已确认入库 · ' + offer.license };
       }
       throw new ApiError('已提交但尚未确认拥有状态，可稍后重试核对');
     }
   }
-  const api = Object.freeze({ listingId, scan, amount, selectOffer, Client, ApiError, Paused });
+  const api = Object.freeze({ listingId, scan, amount, selectOffer, RequestGate, Client, ApiError, Paused });
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.FabFreeCore = api;
 })(globalThis);

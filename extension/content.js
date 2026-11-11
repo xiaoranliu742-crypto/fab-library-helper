@@ -28,7 +28,7 @@
     .check{display:flex;align-items:center;gap:7px;color:#b3b1c3;font-size:12px;margin:10px 0 13px}.check input{accent-color:#9ff1bc;width:14px;height:14px}
     .actions{display:flex;gap:8px}.btn{border:1px solid #41414f;border-radius:9px;padding:9px 12px;background:#262631;color:#dfdeeb}.primary{flex:1;background:#a1f0bc;color:#12331e;border-color:#a1f0bc;font-weight:650}.stop{background:#3e2d23;color:#ffd1a1;border-color:#6a4a32}
     .list-head{display:flex;align-items:center;justify-content:space-between;margin:18px 0 8px;color:#a3a1b5;font-size:11px}.link-btn{border:0;background:none;color:#c4c2d4;padding:0;font-size:11px}.link-btn:disabled{opacity:.35}
-    .list{max-height:min(280px,33vh);overflow:auto;scrollbar-width:thin;scrollbar-color:#414151 transparent}.row{display:flex;gap:8px;padding:10px 1px;border-top:1px solid #ffffff09;align-items:flex-start}.mark{width:18px;flex:none;text-align:center;color:#9693aa}.meta{min-width:0;flex:1}.name{display:block;color:#d2d0e0;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}.name:hover{color:#b5f3cd}.note{font-size:10px;color:#8c8a9e;overflow-wrap:anywhere;margin-top:3px}.state{font-size:10px;white-space:nowrap;color:#9b98ac}
+    .list{max-height:min(280px,33vh);overflow:auto;scrollbar-width:thin;scrollbar-color:#414151 transparent}.row{display:flex;gap:8px;padding:10px 1px;border-top:1px solid #ffffff09;align-items:flex-start}.mark{width:18px;flex:none;text-align:center;color:#9693aa}.meta{min-width:0;flex:1}.name{display:block;color:#d2d0e0;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}.name:hover{color:#b5f3cd}.note,.rate-hint{font-size:10px;color:#8c8a9e;overflow-wrap:anywhere;margin-top:3px}.state{font-size:10px;white-space:nowrap;color:#9b98ac}
     .empty{padding:20px 5px;text-align:center;color:#9b98ac;font-size:12px}.footer{font-size:10px;color:#777487;margin-top:12px;display:flex;justify-content:space-between;gap:12px}
     @media(prefers-reduced-transparency:reduce){.shell{backdrop-filter:none;background:#14141d}}
     @media(max-width:430px){.body{padding:2px 12px 14px}.bar{gap:5px}.stat{padding:8px}.num{font-size:19px}}
@@ -44,11 +44,12 @@
     <div class="settings"><label class="field">领取授权<select id="license"><option value="auto">自动 · 只选零元授权</option><option value="professional">Professional · 专业</option><option value="personal">Personal · 个人</option></select></label>
     <label class="field">领取后间隔<select id="delay"><option value="500">0.5 秒 · 快速</option><option value="1000">1 秒</option><option value="2000">2 秒</option><option value="4000">4 秒</option><option value="8000">8 秒</option></select></label></div>
     <label class="field">同时处理<select id="concurrency"><option value="3">3 项 · 并发快速</option><option value="5">5 项</option><option value="8">8 项</option><option value="16">16 项</option><option value="32">32 项</option><option value="1">1 项 · 串行</option></select></label>
+    <p class="rate-hint">本页所有插件请求至少间隔 1 秒；领取后间隔另计。</p>
     <label class="check" id="scroll-option"><input type="checkbox" id="scroll">自动向下滚动，继续处理新加载的素材</label>
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.2</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.3</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -66,8 +67,26 @@
   const labels = { pending: '待核对', processing: '核对中', claimed: '已入库', owned: '已拥有', skipped: '已跳过', failed: '失败' };
   const marks = { pending: '·', processing: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const requestGate = new Core.RequestGate({ interval: 1000 });
+  const cooldownKey = 'fabHelperRateLimit_v1';
+  let cooldownTimer;
+  async function loadCooldown() {
+    try {
+      const saved = (await chrome.storage.local.get(cooldownKey))[cooldownKey];
+      if (saved?.version === 1 && Number.isFinite(saved.until)) requestGate.blockUntil(saved.until);
+    } catch { /* The in-page gate still protects the current task if storage is unavailable. */ }
+  }
   const client = new Core.Client({ fetch: window.fetch.bind(window), cookie: () => document.cookie,
-    onHalt: e => { stopRequested = true; setMessage(e.message, true); } });
+    beforeRequest: ({ afterSubmission = false } = {}) => requestGate.wait(() => !afterSubmission && shouldStop()),
+    onHalt: async e => {
+      stopRequested = true;
+      if (e.status === 429) requestGate.blockUntil(e.retryAt || Date.now() + 60000);
+      setMessage(e.message, true);
+      if (e.status === 429) {
+        try { await chrome.storage.local.set({ [cooldownKey]: { version: 1, until: requestGate.cooldownUntil } }); }
+        catch { setMessage(e.message + '；冷却记录保存失败，请保持本页打开。', true); }
+      }
+    } });
   const escape = text => String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
   const csrf = () => document.cookie.match(/(?:^|;\s*)fab_csrftoken=([^;]+)/)?.[1] || '';
@@ -172,11 +191,14 @@
     const pct = all.length ? Math.round(100 * done / all.length) : 0;
     $('.fill').style.width = pct + '%';
     $('.track').setAttribute('aria-valuenow', pct);
-    $('#start').disabled = running || (catalogMode() ? catalog?.done === true && !counts.failed : !all.some(i => i.status === 'pending') && !$('#scroll').checked);
-    $('#start').textContent = catalogMode() && catalog?.done && counts.failed ? '重试未完成' : done ? '继续入库' : '开始入库';
+    const cooling = Math.max(0, requestGate.cooldownUntil - Date.now());
+    if (cooldownTimer) { clearTimeout(cooldownTimer); cooldownTimer = null; }
+    if (cooling) cooldownTimer = setTimeout(() => { cooldownTimer = null; render(); }, Math.min(1000, cooling));
+    $('#start').disabled = running || cooling > 0 || (catalogMode() ? catalog?.done === true && !counts.failed : !all.some(i => i.status === 'pending') && !$('#scroll').checked);
+    $('#start').textContent = cooling ? '冷却 ' + Math.ceil(cooling / 1000) + ' 秒' : catalogMode() && catalog?.done && counts.failed ? '重试未完成' : done ? '继续入库' : '开始入库';
     $('#pause').disabled = !running || stopRequested;
     $('#scan').disabled = running;
-    $('#retry').disabled = running || !counts.failed;
+    $('#retry').disabled = running || cooling > 0 || !counts.failed;
     $('#export').disabled = !all.length;
     $('#clear-memory').disabled = running || !progressReady || (!progress.size && !catalog);
     $('#memory').textContent = browserLabel + ' · ' + (progressReady ? `本地已记住 ${progress.size} 项 · ${progressNotice || '同账号再次遇到时直接跳过'}` : progressNotice || '本地进度：开始后自动保存已确认项目');
@@ -249,6 +271,7 @@
       }
     }
     try {
+      await loadCooldown();
       setMessage('正在识别 Fab 账号并恢复本地进度…');
       await loadProgress();
       render();
@@ -433,6 +456,7 @@
       $('#scroll').checked = saved.scroll === true;
     }
   } catch { /* Defaults work even if local settings are unavailable. */ }
+  await loadCooldown();
   chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (msg?.type === 'FAB_HELPER_OPEN') { open(true); respond({ ok: true }); }
   });
