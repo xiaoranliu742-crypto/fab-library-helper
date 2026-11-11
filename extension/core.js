@@ -1,4 +1,4 @@
-/* Fab 免费素材助手 — Copyright (c) 2026 jushan. MIT. No external services. */
+/* Fab 免费素材助手 — Copyright (c) 2026 菊山 (jushan). MIT. No external services. */
 (function (root) {
   'use strict';
   const UUID = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';

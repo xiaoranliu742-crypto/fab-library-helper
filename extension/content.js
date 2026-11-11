@@ -1,4 +1,4 @@
-/* Copyright (c) 2026 jushan. MIT License. */
+/* Copyright (c) 2026 菊山 (jushan). MIT License. */
 (async function () {
   'use strict';
   if (document.getElementById('fab-free-helper-root')) return;
@@ -42,12 +42,12 @@
     <p class="message" id="message" role="status" aria-live="polite">正在扫描当前网页…</p>
     <div class="settings"><label class="field">领取授权<select id="license"><option value="auto">自动 · 只选零元授权</option><option value="professional">Professional · 专业</option><option value="personal">Personal · 个人</option></select></label>
     <label class="field">领取后间隔<select id="delay"><option value="500">0.5 秒 · 快速</option><option value="1000">1 秒</option><option value="2000">2 秒</option><option value="4000">4 秒</option><option value="8000">8 秒</option></select></label></div>
-    <label class="field">同时处理<select id="concurrency"><option value="3">3 项 · 并发快速</option><option value="5">5 项</option><option value="8">8 项</option><option value="1">1 项 · 串行</option></select></label>
+    <label class="field">同时处理<select id="concurrency"><option value="3">3 项 · 并发快速</option><option value="5">5 项</option><option value="8">8 项</option><option value="16">16 项</option><option value="32">32 项</option><option value="1">1 项 · 串行</option></select></label>
     <label class="check"><input type="checkbox" id="scroll">自动向下滚动，继续处理新加载的素材</label>
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span>by jushan · v1.3.0</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.4.0</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -158,7 +158,7 @@
     runCsrf = csrf();
     const preference = $('#license').value, delay = Number($('#delay').value), autoScroll = $('#scroll').checked;
     const requested = Number($('#concurrency').value);
-    const concurrency = [1, 3, 5, 8].includes(requested) ? requested : 3;
+    const concurrency = [1, 3, 5, 8, 16, 32].includes(requested) ? requested : 3;
     let emptyRounds = 0;
     discover();
     setMessage(`开始核对当前网页的素材 · 最多同时处理 ${concurrency} 项…`);
@@ -247,7 +247,7 @@
     if (saved) {
       if (['auto', 'professional', 'personal'].includes(saved.license)) $('#license').value = saved.license;
       if (['500', '1000', '2000', '4000', '8000'].includes(String(saved.delay))) $('#delay').value = String(saved.delay);
-      if (['1', '3', '5', '8'].includes(String(saved.concurrency))) $('#concurrency').value = String(saved.concurrency);
+      if (['1', '3', '5', '8', '16', '32'].includes(String(saved.concurrency))) $('#concurrency').value = String(saved.concurrency);
       $('#scroll').checked = saved.scroll === true;
     }
   } catch { /* Defaults work even if local settings are unavailable. */ }

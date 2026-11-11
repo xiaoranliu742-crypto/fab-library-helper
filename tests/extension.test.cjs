@@ -300,11 +300,12 @@ test('serial option and pause prevent reserving another asset while a read is in
   assert.equal(h.posts, 0);
 });
 
-test('a rate limit stops other workers before POST and drains their outstanding reads', async t => {
+for (const concurrency of [3, 32]) test(`a rate limit stops ${concurrency} workers before POST and drains their outstanding reads`, async t => {
   let releaseOther, releaseLimited;
   const other = new Promise(resolve => { releaseOther = resolve; });
   const limited = new Promise(resolve => { releaseLimited = resolve; });
-  const h = await uiFixture(t, { html: assetGrid([A, B, C]), fetch: async (url, init) => {
+  const ids = [A, ...Array.from({ length: concurrency - 1 }, (_, i) => i.toString(16).padStart(8, '0') + '-aaaa-4aaa-8aaa-aaaaaaaaaaaa')];
+  const h = await uiFixture(t, { html: assetGrid(ids), settings: { concurrency: String(concurrency) }, fetch: async (url, init) => {
     if (url.includes('listings-states')) return response({ acquired: false });
     if (init.method === 'POST') return response(null, 204);
     if (url.includes(A) && url.endsWith('/prices-infos')) { await limited; return response({}, 429); }
@@ -313,7 +314,7 @@ test('a rate limit stops other workers before POST and drains their outstanding 
   } });
   h.shadow.querySelector('#start').click();
   try {
-    await until(() => h.calls.length === 9, 'all three preflights should start');
+    await until(() => h.calls.length === concurrency * 3, 'all preflights should start');
     releaseLimited();
     await until(() => /限流/.test(h.shadow.querySelector('#message').textContent), 'rate limit must be reported immediately');
     assert.equal(h.shadow.querySelector('#start').disabled, true);
@@ -323,8 +324,8 @@ test('a rate limit stops other workers before POST and drains their outstanding 
   await until(() => h.shadow.querySelector('#concurrency').disabled === false, 'all outstanding reads must settle');
   assert.equal(h.posts, 0);
   assert.equal(h.shadow.querySelector('#failed').textContent, '1');
-  assert.equal(h.shadow.querySelectorAll('.state').length, 3);
-  assert.equal([...h.shadow.querySelectorAll('.state')].filter(e => e.textContent === '待核对').length, 2);
+  assert.equal(h.shadow.querySelectorAll('.state').length, concurrency);
+  assert.equal([...h.shadow.querySelectorAll('.state')].filter(e => e.textContent === '待核对').length, concurrency - 1);
 });
 
 test('pause waits for submitted claims to verify while stopping unsubmitted workers', async t => {
@@ -494,8 +495,8 @@ test('clearing local records touches only the active account and makes no Fab wr
   assert.equal(h.shadow.querySelector('#start').disabled, false);
 });
 
-for (const concurrency of [5, 8]) test(`${concurrency}-asset mode respects the selected in-flight limit and pauses cleanly`, async t => {
-  const ids = Array.from({ length: 10 }, (_, i) => i.toString(16).padStart(8, '0') + '-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+for (const concurrency of [5, 8, 16, 32]) test(`${concurrency}-asset mode respects the selected in-flight limit and pauses cleanly`, async t => {
+  const ids = Array.from({ length: concurrency + 2 }, (_, i) => i.toString(16).padStart(8, '0') + '-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
   let release;
   const barrier = new Promise(resolve => { release = resolve; });
   const h = await uiFixture(t, { html: assetGrid(ids), stateBarrier: barrier, settings: { concurrency: String(concurrency) } });
