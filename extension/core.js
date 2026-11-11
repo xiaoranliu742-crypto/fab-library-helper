@@ -76,6 +76,24 @@
     return { ...chosen, license: slugOf(licenses.find(l => l.offerId === chosen.offerId) || {}) || '零元授权' };
   }
 
+  // The current listing response can already contain complete per-license prices.
+  // Any missing field or mismatched listing falls back to the dedicated price endpoint.
+  function detailPrices(detail, id) {
+    if (typeof detail?.uid !== 'string' || detail.uid.toLowerCase() !== id.toLowerCase() || !Array.isArray(detail.licenses) || !detail.licenses.length) return null;
+    const seen = new Set(), offers = [];
+    let currency;
+    for (const license of detail.licenses) {
+      const tier = license?.priceTier;
+      if (typeof license?.offerId !== 'string' || !license.offerId || seen.has(license.offerId) || !tier || !/^[A-Z]{3}$/.test(tier.currencyCode || '')) return null;
+      if (currency && currency !== tier.currencyCode) return null;
+      currency = tier.currencyCode;
+      const offer = { offerId: license.offerId, price: tier.price, discountedPrice: tier.discountedPrice };
+      if (amount(offer) === null || amount(offer) < 0) return null;
+      seen.add(license.offerId); offers.push(offer);
+    }
+    return { offers };
+  }
+
   // Reserve request starts across all workers; waiting never consumes a network timeout.
   class RequestGate {
     constructor({ interval = 1000, now = () => Date.now(), sleep = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
@@ -198,11 +216,11 @@
       });
       return { items, next };
     }
-    async states(ids) {
+    async states(ids, afterSubmission = false) {
       if (!Array.isArray(ids) || !ids.length || ids.length > 24 || !ids.every(id => UID.test(id))) throw new ApiError('批量状态编号无法识别');
       const params = new URLSearchParams();
       for (const id of ids) params.append('listing_ids', id);
-      const rows = await this.request('/i/users/me/listings-states?' + params);
+      const rows = await this.request('/i/users/me/listings-states?' + params, 'GET', undefined, { afterSubmission });
       if (!Array.isArray(rows)) throw new ApiError('批量拥有状态无法识别，将逐项核对');
       const result = new Map();
       for (const row of rows) {
@@ -212,21 +230,16 @@
       // Missing entries are deliberately left unknown and use individual verification.
       return result;
     }
-    async claim(item, preferred = 'auto', shouldStop = () => false, knownUnowned = false) {
+    async claim(item, preferred = 'auto', shouldStop = () => false, knownUnowned = false, deferConfirmation = false) {
       if (!UID.test(item.id)) throw new ApiError('无效素材编号');
       const checkpoint = () => { if (shouldStop()) throw new Paused(); };
       checkpoint();
       if (knownUnowned !== true && await this.state(item.id)) return { status: 'owned', note: '已在当前账号素材库中' };
       checkpoint();
-      // These are independent reads. Wait for both, including failures, before a write or next item.
-      const reads = await Promise.allSettled([
-        this.request('/i/listings/' + item.id),
-        this.request('/i/listings/' + item.id + '/prices-infos')
-      ]);
-      const failure = reads.find(r => r.status === 'rejected' && r.reason?.halt) || reads.find(r => r.status === 'rejected');
-      if (failure) throw failure.reason;
+      const detail = await this.request('/i/listings/' + item.id);
       checkpoint();
-      const [detail, prices] = reads.map(r => r.value);
+      const prices = detailPrices(detail, item.id) || await this.request('/i/listings/' + item.id + '/prices-infos');
+      checkpoint();
       if (typeof detail?.title === 'string') item.name = detail.title.slice(0, 240);
       const offer = selectOffer(detail, prices, preferred);
       if (!offer) return { status: 'skipped', note: '没有核对到零元授权，已跳过' };
@@ -242,6 +255,7 @@
         }
         throw error;
       }
+      if (deferConfirmation === true) return { status: 'submitted', note: '已提交 · 等待本页批量确认', license: offer.license };
       // A POST, closed dialog or disabled button is not proof of ownership.
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt) await this.sleep(1000 * attempt);

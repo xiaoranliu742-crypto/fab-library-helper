@@ -98,47 +98,31 @@ test('claims a verified zero-cost offer then confirms acquired state', async () 
   assert.match(h.calls.at(-1).url, /listings-states/);
 });
 
-test('detail and price reads overlap, but no POST starts until both reads finish', async () => {
-  let release;
-  const barrier = new Promise(resolve => { release = resolve; });
-  const started = new Set();
-  let posts = 0;
-  const client = new Core.Client({ cookie: () => 'fab_csrftoken=fixture-only', fetch: async (url, init) => {
-    if (url.includes('listings-states')) return response({ acquired: posts > 0 });
-    if (init.method === 'POST') { posts++; return response(null, 204); }
-    const phase = url.endsWith('/prices-infos') ? 'prices' : 'detail';
-    started.add(phase);
-    await barrier;
-    return response(phase === 'prices' ? zero : detail);
-  } });
-  const run = client.claim(item());
-  try {
-    await new Promise(resolve => setTimeout(resolve, 15));
-    assert.deepEqual([...started].sort(), ['detail', 'prices']);
-    assert.equal(posts, 0);
-  } finally { release(); }
-  assert.equal((await run).status, 'claimed');
-  assert.equal(posts, 1);
+test('fallback prices are queried only after incomplete detail, with no POST before zero-price verification', async () => {
+  let releaseDetail,releasePrices;const d=new Promise(r=>{releaseDetail=r;}),p=new Promise(r=>{releasePrices=r;});
+  const started=[];let posts=0;
+  const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',fetch:async(url,init)=>{
+    if(url.includes('listings-states'))return response({acquired:posts>0});
+    if(init.method==='POST'){posts++;return response(null,204);}
+    if(url.endsWith('/prices-infos')){started.push('prices');await p;return response(zero);}
+    started.push('detail');await d;return response(detail);
+  }});
+  const run=client.claim(item());
+  try{
+    await new Promise(r=>setTimeout(r,15));
+    assert.deepEqual(started,['detail']);assert.equal(posts,0);
+    releaseDetail();await new Promise(r=>setTimeout(r,15));
+    assert.deepEqual(started,['detail','prices']);assert.equal(posts,0);
+  }finally{releaseDetail();releasePrices();}
+  assert.equal((await run).status,'claimed');
 });
 
-test('parallel read failures drain together and a rate limit still stops the batch', async () => {
-  let release;
-  const barrier = new Promise(resolve => { release = resolve; });
-  let settled = false, posts = 0;
-  const client = new Core.Client({ fetch: async (url, init) => {
-    if (url.includes('listings-states')) return response({ acquired: false });
-    if (init.method === 'POST') { posts++; return response(null, 204); }
-    if (url.endsWith('/prices-infos')) { await barrier; return response({}, 429); }
-    return response({}, 500);
-  } });
-  const run = client.claim(item());
-  run.then(() => { settled = true; }, () => { settled = true; });
-  try {
-    await new Promise(resolve => setTimeout(resolve, 15));
-    assert.equal(settled, false);
-  } finally { release(); }
-  await assert.rejects(run, error => error.status === 429 && error.halt);
-  assert.equal(posts, 0);
+test('a failed detail stops before any price or POST request', async () => {
+  const calls=[];
+  const client=new Core.Client({fetch:async(url,init)=>{calls.push({url,init});return response(url.includes('listings-states')?{acquired:false}:{},url.includes('listings-states')?200:500);}});
+  await assert.rejects(client.claim(item()),e=>e.status===500);
+  assert.equal(calls.length,2);
+  assert.ok(!calls.some(c=>c.url.endsWith('/prices-infos')||c.init.method==='POST'));
 });
 
 test('a successful POST does not count as success if ownership remains false', async () => {
@@ -256,8 +240,8 @@ test('speed upgrade preserves an existing user-selected interval', async t => {
 });
 
 const assetGrid = ids => '<main><section>' + ids.map(id => `<article><a href="/listings/${id}">Asset ${id}</a><p>From Free</p></article>`).join('') + '</section></main>';
-async function until(predicate, message) {
-  const deadline = Date.now() + 3000;
+async function until(predicate, message, timeout = 3000) {
+  const deadline = Date.now() + timeout;
   while (!predicate() && Date.now() < deadline) await tick();
   assert.ok(predicate(), message);
 }
@@ -318,7 +302,7 @@ for (const concurrency of [3, 32]) test(`a rate limit stops ${concurrency} worke
   } });
   h.shadow.querySelector('#start').click();
   try {
-    await until(() => h.calls.length === concurrency * 3, 'all preflights should start');
+    await until(() => h.calls.length === concurrency * 2 + 1, 'details and the limited price fallback should start');
     releaseLimited();
     await until(() => /限流/.test(h.shadow.querySelector('#message').textContent), 'rate limit must be reported immediately');
     assert.equal(h.shadow.querySelector('#start').disabled, true);
@@ -616,7 +600,7 @@ test('catalogue mode streams pages, checks owned batches and claims only new zer
   assert.equal(h.shadow.querySelector('#claimed').textContent, '1');
   assert.equal(h.shadow.querySelectorAll('.list img').length, 0);
   assert.equal(h.calls.filter(c => c.url.includes('/listings/search?')).length, 2);
-  assert.equal(h.calls.filter(c => c.url.includes('/listings-states?')).length, 2);
+  assert.equal(h.calls.filter(c => c.url.includes('/listings-states?')).length, 3);
   assert.ok(!h.calls.some(c => c.url.endsWith('/listings-states/' + A) || c.url.endsWith('/listings-states/' + B)));
   assert.equal(h.storage[catalogRecord('fixture-account')].pages, 2);
 });
@@ -1158,7 +1142,7 @@ test('fresh bulk unowned results remove only redundant preflight reads and still
   let submitted=false;
   const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:async(url,init)=>{
     if(url.includes('/listings/search?'))return response(catalogPage([A]));
-    if(url.includes('/listings-states?'))return response([{uid:A,acquired:false}]);
+    if(url.includes('/listings-states?'))return response([{uid:A,acquired:submitted}]);
     if(url.includes('listings-states/'))return response({acquired:submitted});
     if(init.method==='POST'){submitted=true;return response(null,204);}
     return response(url.endsWith('/prices-infos')?zero:detail);
@@ -1166,7 +1150,8 @@ test('fresh bulk unowned results remove only redundant preflight reads and still
   h.shadow.querySelector('#start').click();
   await until(()=>!h.shadow.querySelector('#scope').disabled,'fresh bulk page completes');
   assert.equal(h.posts,1);
-  assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,1);
+  assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,0);
+  assert.equal(h.calls.filter(c=>c.url.includes('/listings-states?')).length,2);
   assert.equal(h.calls.filter(c=>c.url.endsWith('/prices-infos')).length,1);
   assert.equal(h.shadow.querySelector('#owned').textContent,'1');
   assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
@@ -1235,7 +1220,7 @@ test('an ordinary failed free item is automatically rechecked once, then only co
   let prices=0,submitted=false;
   const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:async(url,init)=>{
     if(url.includes('/listings/search?'))return response(catalogPage([A]));
-    if(url.includes('/listings-states?'))return response([{uid:A,acquired:false}]);
+    if(url.includes('/listings-states?'))return response([{uid:A,acquired:submitted}]);
     if(url.includes('listings-states/'))return response({acquired:submitted});
     if(init.method==='POST'){submitted=true;return response(null,204);}
     if(url.endsWith('/prices-infos'))return ++prices===1?response({},500):response(zero);
@@ -1288,4 +1273,170 @@ test('reusing a fresh unowned batch result never skips price checks or submits a
   assert.equal(h.writes,0);
   assert.equal(h.calls.filter(c=>c.url.includes('listings-states')).length,0);
   assert.equal(h.calls.filter(c=>c.url.endsWith('/prices-infos')).length,1);
+});
+
+
+const pricedDetail=(id=A,personal=0,professional=0)=>({uid:id,title:'Verified fixture',licenses:[
+  {slug:'personal',offerId:'personal-offer',priceTier:{currencyCode:'CNY',price:personal,discountedPrice:null}},
+  {slug:'professional',offerId:'professional-offer',priceTier:{currencyCode:'CNY',price:professional,discountedPrice:null}}
+]});
+
+test('complete fresh detail prices avoid the separate prices request without weakening license choice', async () => {
+  for(const preference of ['auto','personal','professional']){
+    const calls=[];let posted=false;
+    const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',fetch:async(url,init)=>{
+      calls.push({url,init});
+      if(url.includes('listings-states'))return response({acquired:posted});
+      if(init.method==='POST'){posted=true;assert.equal(JSON.parse(init.body).offerId,preference==='personal'?'personal-offer':'professional-offer');return response(null,204);}
+      return response(url.endsWith('/prices-infos')?zero:pricedDetail());
+    }});
+    assert.equal((await client.claim(item(),preference)).status,'claimed');
+    assert.equal(calls.filter(c=>c.url.endsWith('/prices-infos')).length,0);
+  }
+});
+
+test('fresh detail price reuse rejects paid licenses and falls back for any incomplete or mismatched data', async () => {
+  for(const preference of ['auto','professional']){
+    let posts=0;
+    const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',fetch:async(url,init)=>{
+      if(url.includes('listings-states'))return response({acquired:posts>0});
+      if(init.method==='POST'){posts++;assert.equal(JSON.parse(init.body).offerId,'personal-offer');return response(null,204);}
+      return response(url.endsWith('/prices-infos')?zero:pricedDetail(A,0,99));
+    }});
+    if(preference==='professional')await assert.rejects(client.claim(item(),preference),/零元/);
+    else assert.equal((await client.claim(item(),preference)).status,'claimed');
+    assert.equal(posts,preference==='auto'?1:0);
+  }
+  for(const bad of [null,{}, {currencyCode:'CNY',price:''},{currencyCode:'CNY',price:false}]){
+    const d=pricedDetail();d.licenses[1].priceTier=bad;
+    const h=harness({detail:d});
+    assert.equal((await h.client.claim(item())).status,'claimed');
+    assert.equal(h.calls.filter(c=>c.url.endsWith('/prices-infos')).length,1);
+  }
+  const wrong=harness({detail:pricedDetail(B),prices:{offers:[{offerId:'paid',price:99}]}});
+  assert.equal((await wrong.client.claim(item())).status,'skipped');
+  assert.equal(wrong.writes,0);
+});
+
+test('deferred catalogue submission is never reported or stored as confirmed ownership', async () => {
+  let posts=0;
+  const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',fetch:async(url,init)=>{
+    if(init.method==='POST'){posts++;return response(null,204);}
+    if(url.includes('listings-states'))return response({acquired:false});
+    return response(url.endsWith('/prices-infos')?zero:pricedDetail());
+  }});
+  const result=await client.claim(item(),'auto',()=>false,true,true);
+  assert.equal(result.status,'submitted');
+  assert.equal(posts,1);
+});
+
+function fastCatalogueFixture(submitted, overrides={}) {
+  return async (url,init)=>{
+    const p=searchUrl(url);
+    if(p.pathname==='/i/listings/search')return response(catalogPage(overrides.ids||[A,B]));
+    if(p.pathname==='/i/users/me/listings-states'){
+      const ids=p.searchParams.getAll('listing_ids');
+      if(submitted.size&&overrides.confirm)return overrides.confirm(ids);
+      return response(ids.map(uid=>({uid,acquired:submitted.has(uid)})));
+    }
+    const id=url.match(/[a-f0-9-]{36}/)?.[0];
+    if(url.includes('listings-states/'))return response({acquired:overrides.individual?overrides.individual(id):submitted.has(id)});
+    if(init.method==='POST'){submitted.add(id);return response(null,204);}
+    return response(url.endsWith('/prices-infos')?zero:pricedDetail(id));
+  };
+}
+
+test('24 new assets use at most 51 asset requests with one batch confirmation and no separate prices reads', async t => {
+  const ids=[A,B,C,...Array.from({length:21},(_,i)=>i.toString(16).padStart(8,'0')+'-aaaa-4aaa-8aaa-aaaaaaaaaaaa')];
+  const submitted=new Set();
+  const h=await uiFixture(t,{settings:{scope:'quixel',concurrency:'32'},fetch:fastCatalogueFixture(submitted,{ids})});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'optimized page should finish');
+  assert.equal(h.posts,24);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'24');
+  assert.equal(h.shadow.querySelector('#owned').textContent,'24');
+  assert.equal(h.shadow.querySelector('#counter').textContent,'24/24');
+  assert.equal(h.calls.filter(c=>c.url.includes('/listings-states?')).length,2);
+  assert.equal(h.calls.filter(c=>c.url.endsWith('/prices-infos')).length,0);
+  assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,0);
+  assert.ok(h.calls.length<=51,'asset request budget must beat the previous 98');
+  assert.equal(Object.keys(h.storage).filter(k=>k.startsWith('fabHelperOwned_')).length,24);
+});
+
+test('manual pause still confirms submitted catalogue assets in a batch and retains the page cursor', async t => {
+  let started=false,release;const barrier=new Promise(resolve=>{release=resolve;});
+  const submitted=new Set();
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:fastCatalogueFixture(submitted,{confirm:async ids=>{started=true;await barrier;return response(ids.map(uid=>({uid,acquired:true})));}})});
+  h.shadow.querySelector('#start').click();
+  try{
+    await until(()=>started,'post-submission batch should start');
+    assert.equal(h.shadow.querySelector('#claimed').textContent,'0');
+    assert.equal(Object.keys(h.storage).filter(k=>k.startsWith('fabHelperOwned_')).length,0);
+    h.shadow.querySelector('#pause').click();
+  }finally{release();}
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'paused batch should drain');
+  assert.equal(h.posts,2);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'2');
+  assert.equal(h.storage[catalogRecord('fixture-account')],undefined);
+});
+
+test('a rate limit during batch confirmation leaves submissions unconfirmed and never advances the cursor', async t => {
+  const submitted=new Set();
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:fastCatalogueFixture(submitted,{confirm:async()=>response({},429)})});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'limited confirmation should stop');
+  assert.equal(h.posts,2);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'0');
+  assert.equal(Object.keys(h.storage).filter(k=>k.startsWith('fabHelperOwned_')).length,0);
+  assert.equal(h.storage[catalogRecord('fixture-account')],undefined);
+  assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
+  assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,0);
+});
+
+test('partial batch confirmation falls back only for missing IDs and never repeats a submission', async t => {
+  const submitted=new Set();
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:fastCatalogueFixture(submitted,{confirm:async()=>response([{uid:A,acquired:true}])})});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'partial confirmation should fall back');
+  assert.equal(h.posts,2);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'2');
+  assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,1);
+  assert.ok(h.calls.some(c=>c.url.endsWith('listings-states/'+B)));
+});
+
+
+test('negative batch confirmation never caches a POST as success and keeps a durable retry record', async t => {
+  const submitted=new Set();
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:fastCatalogueFixture(submitted,{confirm:async ids=>response(ids.map(uid=>({uid,acquired:false})))})});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'negative confirmations should be retained',7000);
+  assert.equal(h.posts,2);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'0');
+  assert.equal(h.shadow.querySelector('#failed').textContent,'2');
+  assert.equal(Object.keys(h.storage).filter(k=>k.startsWith('fabHelperOwned_')).length,0);
+  assert.ok(h.storage[retryRecord('fixture-account',A)]);
+  assert.ok(h.storage[retryRecord('fixture-account',B)]);
+});
+
+test('a partial confirmation followed by a fallback rate limit preserves already confirmed ownership', async t => {
+  const submitted=new Set();
+  const fetch=fastCatalogueFixture(submitted,{confirm:async()=>response([{uid:A,acquired:true}])});
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:async(url,init)=>url.endsWith('listings-states/'+B)?response({},429):fetch(url,init)});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'partial confirmation limit should drain');
+  assert.equal(h.posts,2);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'1');
+  assert.ok(h.storage['fabHelperOwned_v1_fixture-account_'+A]);
+  assert.equal(h.storage['fabHelperOwned_v1_fixture-account_'+B],undefined);
+  assert.equal(h.storage[catalogRecord('fixture-account')],undefined);
+});
+
+test('malformed confirmation batches safely fall back to individual state reads', async t => {
+  const submitted=new Set();
+  const h=await uiFixture(t,{settings:{scope:'quixel'},fetch:fastCatalogueFixture(submitted,{confirm:async()=>response({bad:'schema'})})});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'malformed batch fallback should finish');
+  assert.equal(h.posts,2);
+  assert.equal(h.shadow.querySelector('#claimed').textContent,'2');
+  assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,2);
 });

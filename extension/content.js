@@ -50,12 +50,12 @@
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.4</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.5</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
   const items = new Map();
-  let running = false, stopRequested = false, expanded = true, routeDirty = false;
+  let running = false, stopRequested = false, expanded = true, routeDirty = false, haltReason = null;
   let route = location.pathname + location.search, message = '', error = false;
   const progressPrefix = 'fabHelperOwned_v1_';
   let progressAccount = null, progressReady = false, progressNotice = '', runCsrf = '';
@@ -65,8 +65,8 @@
   const catalogMode = () => $('#scope').value === 'quixel';
   const catalogKey = () => 'fabHelperCatalog_v1_' + progressAccount + '_quixel';
   const freshCatalog = () => ({ version: 2, sort: 'title', cursor: '', pages: 0, done: false });
-  const labels = { pending: '待核对', processing: '核对中', claimed: '已入库', owned: '已拥有', skipped: '已跳过', failed: '失败' };
-  const marks = { pending: '·', processing: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
+  const labels = { pending: '待核对', processing: '核对中', submitted: '待确认', claimed: '已入库', owned: '已拥有', skipped: '已跳过', failed: '失败' };
+  const marks = { pending: '·', processing: '◌', submitted: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const requestGate = new Core.RequestGate({ interval: 500 });
   const cooldownKey = 'fabHelperRateLimit_v1';
@@ -80,7 +80,7 @@
   const client = new Core.Client({ fetch: window.fetch.bind(window), cookie: () => document.cookie,
     beforeRequest: ({ afterSubmission = false } = {}) => requestGate.wait(() => !afterSubmission && shouldStop()),
     onHalt: async e => {
-      stopRequested = true;
+      stopRequested = true; haltReason = e;
       if (e.status === 429) requestGate.blockUntil(e.retryAt || Date.now() + 60000);
       setMessage(e.message, true);
       if (e.status === 429) {
@@ -173,6 +173,42 @@
     } catch { progressNotice = '待重试记录清理失败，之后仍可核对拥有状态'; }
   }
 
+  async function confirmSubmitted(rows) {
+    let pending = rows.filter(item => item.status === 'submitted');
+    if (!pending.length) return;
+    if (!haltReason) setMessage((stopRequested ? '正在暂停 · ' : '') + '正在批量确认 ' + pending.length + ' 项已提交结果，确认后更新数量…');
+    const rememberConfirmed = async states => {
+      const confirmed = pending.filter(item => states.get(item.id) === true);
+      for (const item of confirmed) { item.status = 'claimed'; item.note = '已批量确认入库 · ' + item.license; }
+      await rememberMany(confirmed);
+      await forgetRetries(confirmed);
+      pending = pending.filter(item => item.status === 'submitted');
+      render();
+    };
+    try {
+      for (let attempt = 0; attempt < 3 && pending.length; attempt++) {
+        if (haltReason) throw haltReason;
+        if (attempt) await sleep(1000 * attempt);
+        let states;
+        try { states = await client.states(pending.map(item => item.id), true); }
+        catch (e) { if (e.halt) throw e; states = new Map(); }
+        // Preserve confirmed entries before a missing entry could hit a login/rate limit.
+        await rememberConfirmed(states);
+        if (!pending.length) break;
+        // Missing or malformed batch entries retain the old individual verification path.
+        for (const item of pending) if (!states.has(item.id)) {
+          try { states.set(item.id, await client.state(item.id, true)); }
+          catch (e) { if (e.halt) throw e; }
+        }
+        await rememberConfirmed(states);
+      }
+      for (const item of pending) { item.status = 'failed'; item.note = '已提交但尚未确认拥有状态，可稍后重试核对'; }
+    } catch (e) {
+      for (const item of pending) { item.status = 'failed'; item.note = '已提交但未确认 · ' + e.message; }
+      throw e;
+    } finally { render(); }
+  }
+
   function render() {
     // Keep only text records; coalesce paints while reading a large catalogue.
     if (running && catalogMode() && $('#scope').disabled && !stopRequested && Date.now() - lastCatalogRender < 100) {
@@ -189,7 +225,7 @@
     for (const key of Object.keys(displayed)) $('#' + key).textContent = displayed[key];
     $('#rate-hint').textContent = '本页请求至少间隔 ' + Number($('#rate').value) / 1000 + ' 秒；限流后自动调慢，领取后间隔另计。';
     $('#counter').textContent = done + '/' + all.length;
-    const active = all.filter(i => i.status === 'processing').length;
+    const active = all.filter(i => ['processing', 'submitted'].includes(i.status)).length;
     $('#summary').textContent = running ? (stopRequested ? '正在暂停 · 等待当前结果' : '正在入库 · ' + active + ' 项处理中 · ' + counts.claimed + ' 项成功') : 'Fab 助手 · ' + (done ? '已入库 ' + counts.claimed + ' 项' : '发现 ' + all.length + ' 项素材');
     $('#message').textContent = message;
     $('#message').classList.toggle('error', error);
@@ -212,9 +248,9 @@
     $('#scroll-option').hidden = catalogMode();
     $('#scan').textContent = catalogMode() ? '从头检查' : '重新扫描';
     $('#found').textContent = catalogMode() ? `整库目录 · 本轮 ${all.length} 项 · 已完成 ${catalog?.pages || 0} 页` : '当前网页 · ' + all.length + ' 项';
-    const priority = all.filter(i => i.status === 'processing').concat(all.filter(i => i.status === 'failed')).slice(0, 60);
+    const priority = all.filter(i => ['processing', 'submitted'].includes(i.status)).concat(all.filter(i => i.status === 'failed')).slice(0, 60);
     const room = 60 - priority.length;
-    const visible = priority.concat(room > 0 ? all.filter(i => !['processing', 'failed'].includes(i.status)).slice(-room) : []);
+    const visible = priority.concat(room > 0 ? all.filter(i => !['processing', 'submitted', 'failed'].includes(i.status)).slice(-room) : []);
     $('#list').innerHTML = visible.length ? visible.map(i => `<div class="row"><span class="mark ${i.status === 'claimed' ? 'green' : ''}">${marks[i.status]}</span><div class="meta"><a class="name" href="${escape(i.href)}" target="_blank" rel="noopener noreferrer" title="${escape(i.name)} · ${escape(i.id)}">${escape(i.name)}</a><div class="note">${escape(i.note || (i.hint === 'free' ? '网页标记免费 · 入库前再次核对价格' : i.hint === 'owned' ? '网页标记已拥有 · 将核对账号状态' : '将核对价格与拥有状态'))}</div></div><span class="state">${labels[i.status]}</span></div>`).join('') : '<div class="empty">当前页面尚未发现素材卡片。<br>请打开卖家页或搜索结果，等待加载后重新扫描。</div>';
   }
   function setMessage(text, isError = false) { message = text; error = isError; render(); }
@@ -246,7 +282,7 @@
     if (retryIds === null && catalogMode() && catalog?.done) retryIds = [...items.values()].filter(item => item.status === 'failed').map(item => item.id);
     if (retryIds && !retryIds.length) return;
     const retryAccount = progressAccount;
-    running = true; stopRequested = false;
+    running = true; stopRequested = false; haltReason = null;
     runCsrf = csrf();
     const preference = $('#license').value, delay = Number($('#delay').value), autoScroll = $('#scroll').checked;
     const fullCatalog = catalogMode() && !retryIds;
@@ -265,7 +301,7 @@
         if (!error) setMessage(`最多同时处理 ${concurrency} 项 · 正在核对：` + item.name);
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
-            Object.assign(item, await client.claim(item, preference, shouldStop, attempt === 0 && checkedUnowned.has(item.id)));
+            Object.assign(item, await client.claim(item, preference, shouldStop, attempt === 0 && checkedUnowned.has(item.id), fullCatalog));
             await remember(item);
             await forgetRetries([item]);
             break;
@@ -402,8 +438,10 @@
       const workers = await Promise.allSettled(Array.from({ length: concurrency }, () => worker()));
       const failure = workers.find(result => result.status === 'rejected');
       if (failure) throw failure.reason;
+      // Even a manual pause must finish ownership verification for submitted items.
+      await confirmSubmitted(batch);
       if (shouldStop()) return;
-      if (batch.some(item => ['pending', 'processing'].includes(item.status))) {
+      if (batch.some(item => ['pending', 'processing', 'submitted'].includes(item.status))) {
         setMessage('本页仍有未处理项目，已保留断点；点击继续入库。', true);
         return;
       }
