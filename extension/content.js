@@ -50,7 +50,7 @@
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.6</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.7</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
@@ -70,37 +70,36 @@
   const marks = { pending: '·', processing: '◌', submitted: '◌', claimed: '✓', owned: '✓', skipped: '—', failed: '!' };
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const requestGate = new Core.RequestGate({ interval: 500 });
-  const cooldownKey = 'fabHelperRateLimit_v1';
-  let cooldownTimer;
-  async function loadCooldown() {
-    try {
-      const saved = (await chrome.storage.local.get(cooldownKey))[cooldownKey];
-      if (saved?.version === 1 && Number.isFinite(saved.until)) requestGate.blockUntil(saved.until);
-    } catch { /* The in-page gate still protects the current task if storage is unavailable. */ }
+  async function clearLegacyCooldown() {
+    // Retire only the old forced-wait marker; ownership and checkpoints remain untouched.
+    try { await chrome.storage.local.remove('fabHelperRateLimit_v1'); }
+    catch { /* Legacy deadlines are ignored even if the stale marker cannot be removed. */ }
   }
   const client = new Core.Client({ fetch: window.fetch.bind(window), cookie: () => document.cookie,
     beforeRequest: ({ afterSubmission = false } = {}) => requestGate.wait(() => !afterSubmission && shouldStop()),
     onHalt: async e => {
       stopRequested = true; haltReason = e;
-      if (e.status === 429) requestGate.blockUntil(e.retryAt || Date.now() + 60000);
       setMessage(e.message, true);
       if (e.status === 429) {
         const index = requestIntervals.indexOf(Number($('#rate').value));
         $('#rate').value = String(requestIntervals[Math.min(requestIntervals.length - 1, (index < 0 ? 2 : index) + 1)]);
         requestGate.interval = Number($('#rate').value);
         await saveSettings();
-        try { await chrome.storage.local.set({ [cooldownKey]: { version: 1, until: requestGate.cooldownUntil } }); }
-        catch { setMessage(e.message + '；冷却记录保存失败，请保持本页打开。', true); }
       }
     } });
   const escape = text => String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
   const csrf = () => document.cookie.match(/(?:^|;\s*)fab_csrftoken=([^;]+)/)?.[1] || '';
+  const pageCsrf = csrf();
+  let pageHintAccount = null;
+  const canTrustPageOwned = () => !!progressAccount && pageHintAccount === progressAccount && pageCsrf === csrf() && runCsrf === csrf();
   const recordPrefix = () => progressPrefix + progressAccount + '_';
   const retryPrefix = () => 'fabHelperRetry_v1_' + progressAccount + '_';
   function restoreItem(item) {
     if (progressReady && progress.has(item.id) && item.status !== 'claimed') {
       item.status = 'owned'; item.note = '本地记录：此前已确认拥有 · 已跳过网络查询';
+    } else if (item.pageOwned === true && item.status !== 'claimed' && canTrustPageOwned()) {
+      item.status = 'owned'; item.note = '网页明确标记已入库 · 已跳过全部素材请求';
     }
   }
   async function loadProgress() {
@@ -126,7 +125,20 @@
       }
       progressReady = true;
       for (const item of items.values()) restoreItem(item);
-    } catch { progressNotice = '本地进度读取失败，本轮继续联网核对；已入库素材不受影响'; }
+    } catch { progressNotice = catalogMode() ? '本地进度读取失败，已停止整库处理' : '本地进度读取失败，本轮继续联网核对；已入库素材不受影响'; }
+  }
+  async function rememberPageOwned(capture = false) {
+    if (!progressAccount || pageCsrf !== csrf() || runCsrf !== csrf()) return;
+    if (pageHintAccount === null) pageHintAccount = progressAccount;
+    if (!canTrustPageOwned()) return;
+    if (capture && catalogMode()) {
+      for (const row of Core.scan(document)) if (row.pageOwned) {
+        const item = items.get(row.id) || row; item.pageOwned = true;
+        restoreItem(item); items.set(item.id, item);
+      }
+    }
+    for (const item of items.values()) if (item.pageOwned) restoreItem(item);
+    await rememberMany([...items.values()].filter(item => item.pageOwned && item.status === 'owned' && !progress.has(item.id)));
   }
   async function remember(item) {
     await rememberMany([item]);
@@ -235,22 +247,19 @@
     const pct = all.length ? Math.round(100 * done / all.length) : 0;
     $('.fill').style.width = pct + '%';
     $('.track').setAttribute('aria-valuenow', pct);
-    const cooling = Math.max(0, requestGate.cooldownUntil - Date.now());
-    if (cooldownTimer) { clearTimeout(cooldownTimer); cooldownTimer = null; }
-    if (cooling) cooldownTimer = setTimeout(() => { cooldownTimer = null; render(); }, Math.min(1000, cooling));
-    $('#start').disabled = running || cooling > 0 || (catalogMode() ? catalog?.done === true && !counts.failed : !all.some(i => i.status === 'pending') && !$('#scroll').checked);
-    $('#start').textContent = cooling ? '冷却 ' + Math.ceil(cooling / 1000) + ' 秒' : catalogMode() && catalog?.done && counts.failed ? '重试未完成' : done ? '继续入库' : '开始入库';
+    $('#start').disabled = running || (catalogMode() ? catalog?.done === true && !counts.failed : !all.some(i => i.status === 'pending') && !counts.failed && !$('#scroll').checked);
+    $('#start').textContent = catalogMode() && catalog?.done && counts.failed ? '重试未完成' : done ? '继续入库' : '开始入库';
     $('#pause').disabled = !running || stopRequested;
     $('#scan').disabled = running;
     $('#turbo').disabled = running;
-    $('#retry').disabled = running || cooling > 0 || !counts.failed;
+    $('#retry').disabled = running || !counts.failed;
     $('#export').disabled = !all.length;
     $('#clear-memory').disabled = running || !progressReady || (!progress.size && !catalog);
     $('#memory').textContent = browserLabel + ' · ' + (progressReady ? `本地已记住 ${progress.size} 项 · ${progressNotice || '同账号再次遇到时直接跳过'}` : progressNotice || '本地进度：开始后自动保存已确认项目');
     for (const el of [$('#license'), $('#delay'), $('#rate'), $('#concurrency'), $('#scroll'), $('#scope')]) el.disabled = running;
     $('#scroll-option').hidden = catalogMode();
     $('#scan').textContent = catalogMode() ? '从头检查' : '重新扫描';
-    $('#found').textContent = catalogMode() ? `整库目录 · 本轮 ${all.length} 项 · 已完成 ${catalog?.pages || 0} 页` : '当前网页 · ' + all.length + ' 项';
+    $('#found').textContent = catalogMode() ? (catalog ? `整库目录 · 本次 ${all.length} 项 · 累计完成 ${catalog.pages} 页` : '整库目录 · 开始后恢复账号断点') : '当前网页 · ' + all.length + ' 项';
     const priority = all.filter(i => ['processing', 'submitted'].includes(i.status)).concat(all.filter(i => i.status === 'failed')).slice(0, 60);
     const room = 60 - priority.length;
     const visible = priority.concat(room > 0 ? all.filter(i => !['processing', 'submitted', 'failed'].includes(i.status)).slice(-room) : []);
@@ -262,10 +271,14 @@
       if (announce) setMessage('Quixel 全库模式：直接分页读取免费目录，不滚动、不加载缩略图。点击开始后自动保存断点。');
       return 0;
     }
-    let added = 0;
-    for (const item of Core.scan(document)) if (!items.has(item.id)) { restoreItem(item); items.set(item.id, item); added++; }
+    let added = 0, changed = false;
+    for (const item of Core.scan(document)) {
+      const known = items.get(item.id);
+      if (!known) { restoreItem(item); items.set(item.id, item); added++; }
+      else if (item.pageOwned && !known.pageOwned) { known.pageOwned = true; restoreItem(known); changed = true; }
+    }
     if (announce) setMessage(items.size ? `已发现 ${items.size} 项素材。点击开始后会逐项核对价格和拥有状态。` : '没有发现素材链接。请确认当前页面已经加载素材卡片。');
-    else if (added) render();
+    else if (added || changed) render();
     return added;
   }
   function open(value) {
@@ -282,7 +295,8 @@
   }
   async function run(retryIds = null) {
     if (running) return;
-    if (retryIds === null && catalogMode() && catalog?.done) retryIds = [...items.values()].filter(item => item.status === 'failed').map(item => item.id);
+    const retryOnly = catalogMode() ? catalog?.done === true : ![...items.values()].some(item => item.status === 'pending') && !$('#scroll').checked;
+    if (retryIds === null && retryOnly) retryIds = [...items.values()].filter(item => item.status === 'failed').map(item => item.id);
     if (retryIds && !retryIds.length) return;
     const retryAccount = progressAccount;
     running = true; stopRequested = false; haltReason = null;
@@ -326,9 +340,9 @@
       }
     }
     try {
-      await loadCooldown();
       setMessage('正在识别 Fab 账号并恢复本地进度…');
       await loadProgress();
+      await rememberPageOwned(true);
       render();
       if (retryIds) {
         if (retryAccount !== progressAccount) {
@@ -362,7 +376,7 @@
       while (!shouldStop()) {
         let item = [...items.values()].find(i => i.status === 'pending');
         // Re-scan only after the known queue drains, not after every asset.
-        if (!item) { discover(); item = [...items.values()].find(i => i.status === 'pending'); }
+        if (!item) { discover(); await rememberPageOwned(); item = [...items.values()].find(i => i.status === 'pending'); }
         if (!item) {
           if (!autoScroll || emptyRounds >= 5) break;
           setMessage('正在向下滚动，等待新素材加载…');
@@ -390,23 +404,29 @@
 
   async function runCatalog(concurrency, worker, setQueue) {
     if (client.showMyLibraryProducts === false) throw new Core.ApiError('请先在 Fab 列表的偏好设置中开启“显示素材库中的产品”，再开始整库模式；隐藏已拥有项目会让分页移位而漏项。');
-    if (!progressAccount || catalogRestart || !catalog || catalogAccount !== progressAccount) {
-      if (!progressAccount || catalogAccount !== progressAccount) items.clear();
-      catalog = freshCatalog(); catalogAccount = progressAccount;
-      const reset = catalogRestart; catalogRestart = false;
-      if (progressReady) {
-        try {
-          if (reset) await chrome.storage.local.remove(catalogKey());
-          const saved = (await chrome.storage.local.get(catalogKey()))[catalogKey()];
-          if (saved?.version === 2 && saved.sort === 'title' && typeof saved.cursor === 'string' && saved.cursor.length <= 2048 && Number.isSafeInteger(saved.pages) && saved.pages >= 0 && typeof saved.done === 'boolean') {
-            catalog = { version: 2, sort: 'title', cursor: saved.cursor, pages: saved.pages, done: saved.done };
-          } else if (saved) {
-            // Offset cursors belong to the old weight order and must never be reused with titles.
-            // Ownership keys are deliberately untouched, including records made by older versions.
-            progressNotice = '已改用标题排序，重建目录位置；已拥有记录保留';
-          }
-        } catch { progressNotice = '目录断点读取失败，将从首页检查；已确认拥有记录仍可复用'; }
+    if (!progressAccount) throw new Core.ApiError('无法识别当前 Fab 账号，已停止，避免忽略本地记录从首页重扫。请确认登录后继续。');
+    if (!progressReady) throw new Core.ApiError('本地进度记录读取失败，已停止，不会从首页重新扫描。请稍后继续。');
+    if (catalogRestart || !catalog || catalogAccount !== progressAccount) {
+      const accountChanged = catalogAccount !== null && catalogAccount !== progressAccount;
+      const reset = catalogRestart;
+      let restored = freshCatalog(), notice = '';
+      try {
+        if (reset) await chrome.storage.local.remove(catalogKey());
+        const saved = (await chrome.storage.local.get(catalogKey()))[catalogKey()];
+        if (saved?.version === 2 && saved.sort === 'title' && typeof saved.cursor === 'string' && saved.cursor.length <= 2048 && Number.isSafeInteger(saved.pages) && saved.pages >= 0 && typeof saved.done === 'boolean' && (saved.done || saved.pages === 0 || saved.cursor.length > 0)) {
+          restored = { version: 2, sort: 'title', cursor: saved.cursor, pages: saved.pages, done: saved.done };
+          notice = saved.done ? '已恢复目录结束断点' : '已恢复断点：本次从第 ' + (saved.pages + 1) + ' 页继续';
+        } else if (saved?.version === 1) {
+          notice = '旧排序断点迁移：重建目录位置，已拥有记录保留并直接跳过';
+        } else if (saved) {
+          throw new Error('invalid checkpoint');
+        }
+      } catch {
+        throw new Core.ApiError('目录断点读取或格式异常，已停止，未从首页重扫。可重试；需要主动重置时再点“从头检查”。');
       }
+      if (accountChanged) items.clear();
+      catalog = restored; catalogAccount = progressAccount; catalogRestart = false;
+      if (notice) progressNotice = notice;
     }
     restoreRetries();
     const visited = new Set();
@@ -454,11 +474,11 @@
         return;
       }
       if (shouldStop()) return;
-      catalog = { ...catalog, cursor: page.next || '', pages: catalog.pages + 1, done: page.next === null };
-      if (progressReady && runCsrf === csrf()) {
-        try { await chrome.storage.local.set({ [catalogKey()]: catalog }); }
-        catch { progressNotice = '目录断点保存失败；刷新后可能从较早页重新检查，已入库素材不受影响'; }
-      }
+      if (!progressReady) throw new Core.ApiError('本地进度记录保存失败，已停在本页，避免继续处理后无法恢复。');
+      const nextCatalog = { ...catalog, cursor: page.next || '', pages: catalog.pages + 1, done: page.next === null };
+      try { await chrome.storage.local.set({ [catalogKey()]: nextCatalog }); }
+      catch { throw new Core.ApiError('目录断点保存失败，已停在本页；已拥有记录保留，可手动继续重试保存。'); }
+      catalog = nextCatalog;
       render();
       // The shared HTTP gate already paces the next page; no second page-level sleep.
     }
@@ -508,7 +528,7 @@
     if (running) return;
     $('#rate').value = '100'; $('#delay').value = '0'; $('#concurrency').value = '16';
     requestGate.interval = 100;
-    setMessage('极速已设置：0.1 秒请求间隔、16 项并发、领取后不额外等待。开始后仍遵守限流冷却与自动降速。');
+    setMessage('极速已设置：0.1 秒请求间隔、16 项并发、领取后不额外等待。限流时暂停并自动降速，由你手动继续。');
     await saveSettings();
   });
   $('#scope').addEventListener('change', async () => { items.clear(); catalog = null; await saveSettings(); discover(true); render(); });
@@ -525,7 +545,7 @@
     }
   } catch { /* Defaults work even if local settings are unavailable. */ }
   requestGate.interval = Number($('#rate').value);
-  await loadCooldown();
+  await clearLegacyCooldown();
   chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     if (msg?.type === 'FAB_HELPER_OPEN') { open(true); respond({ ok: true }); }
   });

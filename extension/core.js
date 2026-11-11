@@ -7,6 +7,13 @@
   const FREE = /\bfree\b|免费|免費/i;
   const OWNED = /saved (?:in|to) my library|in (?:my|your) library|you own|已保存|已存入|已添加到|已加入|已拥有|已擁有/i;
 
+  const OWNED_LABEL = /^(?:saved (?:in|to) my library|in (?:my|your) library|you own(?: this)?|已入库|已(?:拥有|擁有)(?:此(?:素材|资源))?|已保存(?:到|在|至)?(?:我的|您的|你的)?(?:素材库|图书馆|資產庫)|已(?:存入|加入|添加到)(?:我的|您的|你的)?素材库)[.!。！]?$/i;
+  function hasOwnedBadge(card) {
+    return [...card.querySelectorAll('span,p,div,button,small')].some(el =>
+      !el.closest('h1,h2,h3,h4,h5,h6') && !el.querySelector('h1,h2,h3,h4,h5,h6') &&
+      OWNED_LABEL.test((el.textContent || '').replace(/\s+/g, ' ').trim()));
+  }
+
   class ApiError extends Error {
     constructor(message, status = 0) { super(message); this.name = 'ApiError'; this.status = status; }
     get halt() { return [401, 403, 429].includes(this.status); }
@@ -47,7 +54,7 @@
       const titleLink = Array.from(card.querySelectorAll('a[href*="/listings/"]')).find(n => n.textContent.trim());
       const name = (heading?.textContent || a.getAttribute('aria-label') || titleLink?.textContent || card.querySelector('img')?.alt || '未命名素材').trim();
       found.set(id, { id, name: name.slice(0, 240), href: 'https://www.fab.com/listings/' + id,
-        hint: OWNED.test(text) ? 'owned' : FREE.test(text) ? 'free' : 'unknown', status: 'pending', note: '' });
+        hint: OWNED.test(text) ? 'owned' : FREE.test(text) ? 'free' : 'unknown', pageOwned: hasOwnedBadge(card), status: 'pending', note: '' });
     }
     return [...found.values()];
   }
@@ -98,9 +105,8 @@
   class RequestGate {
     constructor({ interval = 1000, now = () => Date.now(), sleep = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
       this.interval = interval; this.now = now; this.sleep = sleep;
-      this.nextAt = 0; this.cooldownUntil = 0; this.queue = Promise.resolve();
+      this.nextAt = 0; this.queue = Promise.resolve();
     }
-    blockUntil(until) { if (Number.isFinite(until)) this.cooldownUntil = Math.max(this.cooldownUntil, until); }
     async wait(shouldStop = () => false) {
       const previous = this.queue;
       let release;
@@ -108,11 +114,6 @@
       await previous;
       const check = () => {
         if (shouldStop()) throw new Paused();
-        if (this.cooldownUntil > this.now()) {
-          const error = new ApiError('Fab 请求限流，冷却 ' + Math.ceil((this.cooldownUntil - this.now()) / 1000) + ' 秒后可手动继续', 429);
-          error.retryAt = this.cooldownUntil;
-          throw error;
-        }
       };
       try {
         check();
@@ -165,10 +166,11 @@
           if (response.status === 429) {
             const now = this.now(), value = response.headers?.get('Retry-After')?.trim();
             const parsed = value && /^\d+$/.test(value) ? now + Number(value) * 1000 : value ? Date.parse(value) : NaN;
-            // Without a usable server value, 60 seconds is our conservative local fallback.
-            const retryAt = Number.isFinite(parsed) ? Math.max(now + 1000, parsed) : now + 60000;
-            const error = new ApiError('Fab 请求限流，冷却 ' + Math.ceil((retryAt - now) / 1000) + ' 秒后可手动继续', 429);
-            error.retryAt = retryAt;
+            // Server advice is informational; the user decides when to resume.
+            const retryAt = Number.isFinite(parsed) ? parsed : undefined;
+            const advice = retryAt === undefined ? '' : 'Fab 建议等待 ' + Math.max(0, Math.ceil((retryAt - now) / 1000)) + ' 秒；';
+            const error = new ApiError('Fab 请求限流，任务已暂停。' + advice + '可手动继续', 429);
+            if (retryAt !== undefined) error.retryAt = retryAt;
             throw error;
           }
           const message = response.status === 401 ? '请先在当前浏览器登录 Fab' :

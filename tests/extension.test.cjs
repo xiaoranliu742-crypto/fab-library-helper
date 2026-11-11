@@ -183,6 +183,7 @@ async function uiFixture(t, options = {}) {
   w.document.cookie = 'fab_csrftoken=fixture-only';
   w.chrome = { runtime: { id: 'local-test', onMessage: { addListener() {} } }, storage: { local: {
     get: async key => {
+      if (options.beforeStorageGet) await options.beforeStorageGet(key);
       if (key === null && options.storageReadError) throw new Error('fixture read failure');
       return JSON.parse(JSON.stringify(key === null ? storage : (key in storage ? { [key]: storage[key] } : {})));
     },
@@ -594,7 +595,7 @@ test('catalogue mode streams pages, checks owned batches and claims only new zer
   h.shadow.querySelector('#start').click();
   await until(() => h.storage[catalogRecord('fixture-account')]?.done === true && h.shadow.querySelector('#scope').disabled === false, 'catalogue should reach the final page');
   assert.equal(scrolls, 0);
-  assert.equal(h.scans, 0);
+  assert.equal(h.scans, 1); // scan visible ownership badges once, without scrolling
   assert.equal(h.posts, 1);
   assert.equal(h.shadow.querySelector('#owned').textContent, '3');
   assert.equal(h.shadow.querySelector('#claimed').textContent, '1');
@@ -1049,18 +1050,18 @@ test('a single gate spaces every request start, including reads and submission c
 test('429 cancels queued requests before fetch and never dispatches the queued POST', async () => {
   const gate=new Core.RequestGate({interval:20});
   let stopped=false;const methods=[];
-  const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',beforeRequest:()=>gate.wait(()=>stopped),onHalt:e=>{stopped=true;gate.blockUntil(e.retryAt);},fetch:async(url,init)=>{methods.push(init.method);return response({},429);}});
+  const client=new Core.Client({cookie:()=> 'fab_csrftoken=fixture-only',beforeRequest:()=>gate.wait(()=>stopped),onHalt:()=>{stopped=true;},fetch:async(url,init)=>{methods.push(init.method);return response({},429);}});
   const results=await Promise.allSettled([client.request('/i/users/me'),client.request('/i/listings/'+A+'/add-to-library','POST',{offerId:'fixture'})]);
   assert.equal(results[0].reason.status,429);
   assert.ok(results[1].reason instanceof Core.Paused);
   assert.deepEqual(methods,['GET']);
 });
 
-test('429 honors Retry-After seconds and HTTP dates, with an explicit fallback when absent', async () => {
+test('429 exposes Retry-After seconds and HTTP dates as advice, with no invented fallback', async () => {
   const now=Date.UTC(2026,10,11,12,0,0);
-  for(const [header,ms] of [['90',90000],[new Date(now+120000).toUTCString(),120000],[null,60000]]){
+  for(const [header,ms] of [['90',90000],[new Date(now+120000).toUTCString(),120000],[null,null]]){
     const client=new Core.Client({now:()=>now,fetch:async()=>({...response({},429),headers:{get:name=>name.toLowerCase()==='retry-after'?header:null}})});
-    await assert.rejects(client.account(),e=>e.status===429&&e.retryAt===now+ms&&/冷却/.test(e.message));
+    await assert.rejects(client.account(),e=>e.status===429&&e.retryAt===(ms===null?undefined:now+ms)&&/手动继续/.test(e.message)&&!/冷却/.test(e.message));
   }
 });
 
@@ -1075,22 +1076,18 @@ test('a submitted claim can still confirm during a manual pause through the requ
   assert.deepEqual(roles,[false,false,false,false,true]);
 });
 
-test('browser-local cooldown survives reload, expires without auto-running and is not shared with another store', async t => {
-  const untilAt=Date.now()+60000;
-  const storage={fabHelperRateLimit_v1:{version:1,until:untilAt}};
+test('legacy cooldown cleanup is browser-local and never starts a task automatically', async t => {
+  const storage={fabHelperRateLimit_v1:{version:1,until:Date.now()+600000}};
+  const otherStorage={fabHelperRateLimit_v1:{version:1,until:Date.now()+600000}};
   const h=await uiFixture(t,{storage,settings:{scope:'quixel'}});
-  assert.equal(h.shadow.querySelector('#start').disabled,true);
-  assert.match(h.shadow.querySelector('#start').textContent,/冷却/);
-  h.shadow.querySelector('#start').click();
-  assert.equal(h.identityCalls,0);
-  assert.equal(h.calls.length,0);
-  const other=await uiFixture(t,{settings:{scope:'quixel'}});
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+  assert.doesNotMatch(h.shadow.querySelector('#start').textContent,/冷却/);
+  assert.equal(storage.fabHelperRateLimit_v1,undefined);
+  assert.ok(otherStorage.fabHelperRateLimit_v1);
+  const other=await uiFixture(t,{storage:otherStorage,settings:{scope:'quixel'}});
   assert.equal(other.shadow.querySelector('#start').disabled,false);
-  const originalNow=Date.now;
-  h.w.Date.now=()=>originalNow()+61000;
-  await until(()=>!h.shadow.querySelector('#start').disabled,'expired cooldown should reenable manual Start');
-  assert.equal(h.identityCalls,0);
-  assert.equal(h.calls.length,0);
+  assert.equal(otherStorage.fabHelperRateLimit_v1,undefined);
+  assert.equal(h.identityCalls,0);assert.equal(h.calls.length,0);
 });
 
 test('a paced 429 pauses queued workers without marking unrequested assets failed', async t => {
@@ -1101,24 +1098,20 @@ test('a paced 429 pauses queued workers without marking unrequested assets faile
   assert.equal(h.posts,0);
   assert.equal(h.shadow.querySelector('#failed').textContent,'1');
   assert.equal([...h.shadow.querySelectorAll('.state')].filter(e=>e.textContent==='待核对').length,1);
-  assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
-  assert.equal(h.shadow.querySelector('#start').disabled,true);
+  assert.equal(h.storage.fabHelperRateLimit_v1,undefined);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
 });
 
-test('clearing ownership after 429 does not erase the server cooldown or allow another request', async t => {
+test('clearing ownership after 429 never starts a new task or creates a cooldown', async t => {
   const storage={['fabHelperOwned_v1_fixture-account_'+A]:{version:1,status:'owned'}};
   const h=await uiFixture(t,{storage,settings:{scope:'quixel'},fetch:async()=>response({},429)});
   h.shadow.querySelector('#start').click();
   await until(()=>!h.shadow.querySelector('#scope').disabled,'directory 429 should pause');
-  const cooldown=JSON.stringify(storage.fabHelperRateLimit_v1);
-  assert.ok(storage.fabHelperRateLimit_v1?.until>Date.now());
-  h.shadow.querySelector('#clear-memory').click();
-  await tick();
-  assert.equal(JSON.stringify(storage.fabHelperRateLimit_v1),cooldown);
-  assert.equal(h.shadow.querySelector('#start').disabled,true);
-  assert.equal(h.calls.length,1);
+  h.shadow.querySelector('#clear-memory').click();await tick();
+  assert.equal(storage.fabHelperRateLimit_v1,undefined);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+  assert.equal(h.calls.length,1);assert.equal(h.posts,0);
 });
-
 
 test('owned total includes new claims without double-counting progress, and Continue preserves the new count', async t => {
   const h=await uiFixture(t);
@@ -1191,14 +1184,14 @@ test('request pace is selectable, browser-local and restored without changing th
   assert.equal(h.identityCalls,0);
 });
 
-test('429 keeps its cooldown and backs the selectable request pace off one step', async t => {
+test('429 pauses for manual recovery and backs the selectable request pace off one step', async t => {
   const h=await uiFixture(t,{settings:{rate:'500'},fetch:async()=>response({},429)});
   h.shadow.querySelector('#start').click();
   await until(()=>!h.shadow.querySelector('#scope').disabled,'rate-limit drain');
   assert.equal(h.shadow.querySelector('#rate').value,'1000');
   assert.equal(h.storage.fabHelperSettings.rate,'1000');
-  assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
-  assert.equal(h.shadow.querySelector('#start').disabled,true);
+  assert.equal(h.storage.fabHelperRateLimit_v1,undefined);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
   assert.equal(h.posts,0);
 });
 
@@ -1389,7 +1382,7 @@ test('a rate limit during batch confirmation leaves submissions unconfirmed and 
   assert.equal(h.shadow.querySelector('#claimed').textContent,'0');
   assert.equal(Object.keys(h.storage).filter(k=>k.startsWith('fabHelperOwned_')).length,0);
   assert.equal(h.storage[catalogRecord('fixture-account')],undefined);
-  assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
+  assert.equal(h.storage.fabHelperRateLimit_v1,undefined);
   assert.equal(h.calls.filter(c=>c.url.includes('listings-states/')).length,0);
 });
 
@@ -1475,24 +1468,23 @@ test('one-click turbo applies a concrete faster configuration without starting o
   assert.equal(h.posts,0);assert.equal(h.identityCalls,0);
 });
 
-test('turbo never clears an active server cooldown or dispatches a request during it', async t => {
-  const cooldown={version:1,until:Date.now()+60000};
-  const h=await uiFixture(t,{storage:{fabHelperRateLimit_v1:cooldown},settings:{scope:'quixel'}});
+test('turbo after legacy cleanup changes settings without dispatching or recreating a cooldown', async t => {
+  const h=await uiFixture(t,{storage:{fabHelperRateLimit_v1:{version:1,until:Date.now()+600000}},settings:{scope:'quixel'}});
   const turbo=h.shadow.querySelector('#turbo');assert.ok(turbo);turbo.click();await tick();
-  assert.deepEqual(h.storage.fabHelperRateLimit_v1,cooldown);
-  assert.equal(h.shadow.querySelector('#start').disabled,true);
+  assert.equal(h.storage.fabHelperRateLimit_v1,undefined);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
   assert.equal(h.calls.length,0);assert.equal(h.identityCalls,0);
 });
 
-test('fast modes back off only to valid interval options and keep 429 cooldown protection', async t => {
+test('fast modes back off only to valid interval options and keep manual 429 stop protection', async t => {
   for(const [before,after] of [['100','250'],['250','500'],['500','1000'],['1000','2000'],['2000','2000']]){
     const h=await uiFixture(t,{settings:{rate:before},fetch:async()=>response({},429)});
     h.shadow.querySelector('#start').click();
     await until(()=>!h.shadow.querySelector('#scope').disabled,'fast rate limit should drain');
     assert.equal(h.shadow.querySelector('#rate').value,after);
     assert.equal(h.storage.fabHelperSettings.rate,after);
-    assert.ok(h.storage.fabHelperRateLimit_v1.until>Date.now());
-    assert.equal(h.shadow.querySelector('#start').disabled,true);
+    assert.equal(h.storage.fabHelperRateLimit_v1,undefined);
+    assert.equal(h.shadow.querySelector('#start').disabled,false);
     assert.equal(h.posts,0);
   }
 });
@@ -1526,4 +1518,162 @@ test('cached catalogue pages have no fixed half-second delay beyond the global r
   for(let i=1;i<starts.length;i++)assert.ok(starts[i]-starts[i-1]<450,'the gate already provides request pacing');
   assert.equal(h.posts,0);
   assert.equal(h.storage[catalogRecord('fixture-account')].pages,3);
+});
+
+
+test('manual resume policy exposes server waiting advice without claiming a forced cooldown', async () => {
+  const now=Date.UTC(2026,10,11,12,0,0);
+  const client=new Core.Client({now:()=>now,fetch:async()=>({...response({},429),headers:{get:()=> '600'}})});
+  await assert.rejects(client.account(),e=>e.status===429&&e.retryAt===now+600000&&/建议/.test(e.message)&&!/冷却/.test(e.message));
+});
+
+test('manual resume policy invents no default waiting duration when Retry-After is missing or invalid', async () => {
+  for(const value of [null,'invalid-header']){
+    const client=new Core.Client({fetch:async()=>({...response({},429),headers:{get:()=>value}})});
+    await assert.rejects(client.account(),e=>e.status===429&&e.retryAt===undefined&&/手动继续/.test(e.message)&&!/60|冷却/.test(e.message));
+  }
+});
+
+test('manual resume policy retires legacy cooldown state without deleting owned records or checkpoints', async t => {
+  const owned='fabHelperOwned_v1_fixture-account_'+A,key=catalogRecord('fixture-account');
+  const storage={fabHelperRateLimit_v1:{version:1,until:Date.now()+600000},[owned]:{version:1,status:'owned'},[key]:{version:2,sort:'title',cursor:'saved',pages:12,done:false}};
+  const expected=JSON.stringify({owned:storage[owned],checkpoint:storage[key]});
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'}});
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+  assert.equal(storage.fabHelperRateLimit_v1,undefined);
+  assert.equal(JSON.stringify({owned:storage[owned],checkpoint:storage[key]}),expected);
+  assert.equal(h.calls.length,0);assert.equal(h.identityCalls,0);
+});
+
+test('manual resume policy pauses 429 once and permits a deliberate Continue without a timer or automatic retry', async t => {
+  let resumed=false;
+  const h=await uiFixture(t,{fetch:async(url,init)=>{
+    assert.notEqual(init.method,'POST');
+    return resumed?response({acquired:true}):{...response({},429),headers:{get:()=> '600'}};
+  }});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'limited task should drain');
+  assert.equal(h.calls.length,1);
+  assert.equal(h.shadow.querySelector('#start').disabled,false);
+  assert.doesNotMatch(h.shadow.querySelector('#start').textContent,/冷却/);
+  await tick();assert.equal(h.calls.length,1);
+  resumed=true;h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'manual Continue should recheck the failed item');
+  assert.equal(h.calls.length,2);
+  assert.equal(h.posts,0);
+  assert.equal(h.shadow.querySelector('#owned').textContent,'1');
+  assert.equal(h.shadow.querySelector('#failed').textContent,'0');
+  assert.equal(h.storage.fabHelperRateLimit_v1,undefined);
+});
+
+
+const ownedCard=(id=A,title='Already owned')=>'<article><a href="/listings/'+id+'"><img alt="'+title+'"></a><h3>'+title+'</h3><p><svg></svg>Saved in My Library</p></article>';
+
+test('explicit webpage ownership labels skip all per-asset requests and are saved for the current account', async t => {
+  const storage={};
+  const h=await uiFixture(t,{storage,html:'<main>'+ownedCard(A)+ownedCard(B)+'</main>',fetch:async()=>{throw Error('owned cards must not issue asset requests');}});
+  h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'owned labels should be accepted directly');
+  assert.equal(h.identityCalls,1);assert.equal(h.calls.length,0);assert.equal(h.posts,0);
+  assert.equal(h.shadow.querySelector('#owned').textContent,'2');
+  assert.equal(storage['fabHelperOwned_v1_fixture-account_'+A].status,'owned');
+  assert.equal(storage['fabHelperOwned_v1_fixture-account_'+B].status,'owned');
+  const reloaded=await uiFixture(t,{storage,fetch:async()=>{throw Error('cache hit must not query the asset');}});
+  reloaded.shadow.querySelector('#start').click();
+  await until(()=>!reloaded.shadow.querySelector('#scope').disabled,'local record should survive refresh');
+  assert.equal(reloaded.calls.length,0);assert.equal(reloaded.shadow.querySelector('#owned').textContent,'1');
+});
+
+test('an asset title containing ownership words is not treated as a webpage ownership badge', () => {
+  const dom=new JSDOM('<main><article><a href="/listings/'+A+'"><img></a><h3>Saved in My Library</h3><p>From Free</p></article></main>',{url:'https://www.fab.com/sellers/fixture'});
+  try{assert.equal(Core.scan(dom.window.document)[0].pageOwned,false);}finally{dom.window.close();}
+});
+
+test('webpage ownership markers are not reused after the verified account or page session changes', async t => {
+  const account={uid:'fixture-account'};
+  const h=await uiFixture(t,{accountResponse:account,html:'<main>'+ownedCard()+'</main>',owned:true});
+  h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'initial marked owner');
+  assert.equal(h.calls.length,0);
+  account.uid='other-account';
+  h.w.document.querySelector('main').innerHTML=ownedCard(A)+'<article><a href="/listings/'+B+'">New row</a><p>From Free</p></article>';
+  h.shadow.querySelector('#scan').click();h.shadow.querySelector('#start').click();
+  await until(()=>!h.shadow.querySelector('#scope').disabled,'changed account must be checked');
+  assert.equal(h.calls.length,2);
+  assert.ok(h.storage['fabHelperOwned_v1_fixture-account_'+A]);
+  assert.ok(h.storage['fabHelperOwned_v1_other-account_'+A]);
+  const changed=await uiFixture(t,{html:'<main>'+ownedCard()+'</main>',owned:true});
+  changed.w.document.cookie='fab_csrftoken=changed-session';
+  changed.shadow.querySelector('#start').click();await until(()=>!changed.shadow.querySelector('#scope').disabled,'changed session needs live state');
+  assert.equal(changed.calls.length,1);
+});
+
+test('saved page 148 resumes its exact cursor and visible owned cards need only the directory request', async t => {
+  const key=catalogRecord('fixture-account'),storage={[key]:{version:2,sort:'title',cursor:'resume-page-149',pages:148,done:false}};
+  const h=await uiFixture(t,{storage,html:'<main>'+ownedCard()+'</main>',settings:{scope:'quixel'},fetch:async url=>{
+    assert.ok(url.includes('/listings/search?'));assert.equal(searchUrl(url).searchParams.get('cursor'),'resume-page-149');
+    return response(catalogPage([A]));
+  }});
+  h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'saved cursor should resume');
+  assert.equal(h.identityCalls,1);assert.equal(h.calls.length,1);assert.equal(h.posts,0);
+  assert.equal(h.shadow.querySelector('#owned').textContent,'1');
+  assert.equal(storage[key].pages,149);
+  assert.match(h.shadow.querySelector('#memory').textContent,/断点.*149/);
+});
+
+test('a checkpoint read failure never silently scans page one and retry reads the saved cursor again', async t => {
+  const key=catalogRecord('fixture-account');let failRead=true;
+  const storage={[key]:{version:2,sort:'title',cursor:'resume-149',pages:148,done:false},['fabHelperOwned_v1_fixture-account_'+A]:{version:1,status:'owned'}};
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'},beforeStorageGet:async k=>{if(k===key&&failRead)throw Error('transient read error');},fetch:async url=>{
+    assert.equal(searchUrl(url).searchParams.get('cursor'),'resume-149');return response(catalogPage([A]));
+  }});
+  h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'read error should stop');
+  assert.equal(h.calls.length,0);assert.equal(storage[key].pages,148);
+  failRead=false;h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'retry should load the same checkpoint');
+  assert.equal(h.calls.length,1);assert.equal(storage[key].pages,149);assert.equal(h.posts,0);
+});
+
+test('an unavailable ownership cache stops catalogue processing before it can rescan without local records', async t => {
+  const h=await uiFixture(t,{storageReadError:true,settings:{scope:'quixel'},fetch:async()=>response(catalogPage([]))});
+  h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'unreadable local records should stop');
+  assert.equal(h.identityCalls,1);assert.equal(h.calls.length,0);assert.equal(h.posts,0);
+  assert.match(h.shadow.querySelector('#message').textContent,/本地.*记录|本地.*进度/);
+});
+
+test('a malformed nonlegacy checkpoint is retained and never treated as a request to restart', async t => {
+  const key=catalogRecord('fixture-account'),record={version:2,sort:'title',cursor:'',pages:148,done:false};
+  const storage={[key]:record};
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'},fetch:async()=>response(catalogPage([]))});
+  h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'invalid checkpoint must stop');
+  assert.equal(h.calls.length,0);assert.deepEqual(storage[key],record);
+});
+
+
+test('catalogue ownership-save failures stop before the next directory page', async t => {
+  const h=await uiFixture(t,{storageWriteError:true,settings:{scope:'quixel'},fetch:async url=>{
+    if(url.includes('/listings/search?'))return response(catalogPage([A],'next'));
+    return response([{uid:A,acquired:true}]);
+  }});
+  h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'save error should stop before advancing');
+  assert.equal(h.calls.filter(c=>c.url.includes('/listings/search?')).length,1);
+  assert.equal(h.storage[catalogRecord('fixture-account')],undefined);
+  assert.equal(h.posts,0);
+  assert.match(h.shadow.querySelector('#message').textContent,/本地.*保存失败/);
+});
+
+
+test('checkpoint write failure retains both saved and in-memory cursors until a manual retry succeeds', async t => {
+  const key=catalogRecord('fixture-account');let failWrite=true;
+  const initial={version:2,sort:'title',cursor:'resume-149',pages:148,done:false};
+  const storage={[key]:initial};for(const id of [A,B])storage['fabHelperOwned_v1_fixture-account_'+id]={version:1,status:'owned'};
+  const cursors=[];
+  const h=await uiFixture(t,{storage,settings:{scope:'quixel'},beforeStorageSet:async values=>{if(key in values&&failWrite)throw Error('checkpoint write error');},fetch:async url=>{
+    assert.ok(url.includes('/listings/search?'));const cursor=searchUrl(url).searchParams.get('cursor');cursors.push(cursor);
+    return response(cursor==='resume-149'?catalogPage([A],'next-150'):catalogPage([B]));
+  }});
+  h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'checkpoint save should halt');
+  assert.deepEqual(cursors,['resume-149']);assert.deepEqual(storage[key],initial);
+  assert.match(h.shadow.querySelector('#message').textContent,/断点保存失败/);
+  failWrite=false;h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'manual retry should resume the same page');
+  assert.deepEqual(cursors,['resume-149','resume-149','next-150']);
+  assert.equal(storage[key].pages,150);assert.equal(storage[key].done,true);assert.equal(h.posts,0);
 });
