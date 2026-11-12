@@ -176,12 +176,12 @@ async function uiFixture(t, options = {}) {
   const w = dom.window;
   if (options.userAgent) Object.defineProperty(w.navigator, 'userAgent', { value: options.userAgent });
   if (options.userAgent) Object.defineProperty(w.navigator, 'userAgent', { value: options.userAgent });
-  const calls = [];
+  const calls = [], messages = [];
   let posts = 0, identityCalls = 0;
   const storage = options.storage || {};
   if (options.settings) storage.fabHelperSettings = options.settings;
   w.document.cookie = 'fab_csrftoken=fixture-only';
-  w.chrome = { runtime: { id: 'local-test', onMessage: { addListener() {} } }, storage: { local: {
+  w.chrome = { runtime: { id: 'local-test', onMessage: { addListener(fn) { messages.push(fn); } } }, storage: { local: {
     get: async key => {
       if (options.beforeStorageGet) await options.beforeStorageGet(key);
       if (key === null && options.storageReadError) throw new Error('fixture read failure');
@@ -218,7 +218,7 @@ async function uiFixture(t, options = {}) {
   w.eval(fs.readFileSync(path.join(__dirname, '../extension/content.js'), 'utf8'));
   await tick();
   const shadow = w.document.getElementById('fab-free-helper-root').shadowRoot;
-  return { w, shadow, calls, storage, get identityCalls() { return identityCalls; }, get posts() { return posts; }, get scans() { return scans; } };
+  return { w, shadow, calls, storage, messages, get identityCalls() { return identityCalls; }, get posts() { return posts; }, get scans() { return scans; } };
 }
 
 test('webpage panel mounts, counts From Free and never auto-claims on load', async t => {
@@ -227,10 +227,11 @@ test('webpage panel mounts, counts From Free and never auto-claims on load', asy
   assert.equal(h.calls.length, 0);
   assert.equal(h.shadow.querySelector('#start').disabled, false);
   assert.equal(h.shadow.querySelector('#delay').value, '500');
-  h.shadow.querySelector('#toggle').click();
   assert.equal(h.shadow.querySelector('#body').hidden, true);
-  h.shadow.querySelector('#summary').click();
+  h.shadow.querySelector('#toggle').click();
   assert.equal(h.shadow.querySelector('#body').hidden, false);
+  h.shadow.querySelector('#summary').click();
+  assert.equal(h.shadow.querySelector('#body').hidden, true);
 });
 
 test('speed upgrade preserves an existing user-selected interval', async t => {
@@ -1676,4 +1677,54 @@ test('checkpoint write failure retains both saved and in-memory cursors until a 
   failWrite=false;h.shadow.querySelector('#start').click();await until(()=>!h.shadow.querySelector('#scope').disabled,'manual retry should resume the same page');
   assert.deepEqual(cursors,['resume-149','resume-149','next-150']);
   assert.equal(storage[key].pages,150);assert.equal(storage[key].done,true);assert.equal(h.posts,0);
+});
+
+
+test('a collapsed panel stays collapsed after refresh, asset navigation and unrelated settings changes', async t => {
+  const storage={},h=await uiFixture(t,{storage});
+  assert.equal(h.shadow.querySelector('#body').hidden,true);
+  h.shadow.querySelector('#summary').click();
+  assert.equal(h.shadow.querySelector('#body').hidden,false);
+  h.shadow.querySelector('#toggle').click();await tick();
+  assert.equal(storage.fabHelperPanel_v1.expanded,false);
+  const detailPage=await uiFixture(t,{storage,url:'https://www.fab.com/listings/'+A});
+  assert.equal(detailPage.shadow.querySelector('#body').hidden,true);
+  assert.equal(detailPage.shadow.querySelector('#summary').getAttribute('aria-expanded'),'false');
+  detailPage.shadow.querySelector('#rate').value='1000';
+  detailPage.shadow.querySelector('#rate').dispatchEvent(new detailPage.w.Event('change'));await tick();
+  const returned=await uiFixture(t,{storage});
+  assert.equal(returned.shadow.querySelector('#body').hidden,true);
+  assert.equal(returned.shadow.querySelector('#rate').value,'1000');
+  assert.equal(h.identityCalls+detailPage.identityCalls+returned.identityCalls,0);
+  assert.equal(h.posts+detailPage.posts+returned.posts,0);
+});
+
+test('explicit toolbar opening and Escape closing update the saved panel preference only', async t => {
+  const owned='fabHelperOwned_v1_fixture-account_'+A,checkpoint=catalogRecord('fixture-account');
+  const storage={fabHelperPanel_v1:{version:1,expanded:false},[owned]:{version:1,status:'owned'},[checkpoint]:{version:2,sort:'title',cursor:'saved',pages:148,done:false}};
+  const before=JSON.stringify({owned:storage[owned],checkpoint:storage[checkpoint]});
+  const h=await uiFixture(t,{storage});assert.equal(h.shadow.querySelector('#body').hidden,true);
+  let reply;for(const listener of h.messages)listener({type:'FAB_HELPER_OPEN'},{},value=>{reply=value;});
+  assert.equal(reply.ok,true);assert.equal(h.shadow.querySelector('#body').hidden,false);await tick();
+  const restored=await uiFixture(t,{storage});
+  assert.equal(restored.shadow.querySelector('#body').hidden,false);
+  restored.shadow.dispatchEvent(new restored.w.KeyboardEvent('keydown',{key:'Escape',bubbles:true}));await tick();
+  assert.equal(storage.fabHelperPanel_v1.expanded,false);
+  assert.equal(JSON.stringify({owned:storage[owned],checkpoint:storage[checkpoint]}),before);
+  const otherBrowser=await uiFixture(t);assert.equal(otherBrowser.shadow.querySelector('#body').hidden,true);
+  assert.equal(h.identityCalls+restored.identityCalls+otherBrowser.identityCalls,0);
+});
+
+test('a delayed preference read never reopens a panel the user has just collapsed', async t => {
+  let releaseRead,releaseWrites;
+  const readBarrier=new Promise(resolve=>{releaseRead=resolve;}),writeBarrier=new Promise(resolve=>{releaseWrites=resolve;});
+  const h=await uiFixture(t,{storage:{fabHelperPanel_v1:{version:1,expanded:true}},beforeStorageGet:async key=>{if(key==='fabHelperPanel_v1')await readBarrier;},beforeStorageSet:async values=>{if(values.fabHelperPanel_v1)await writeBarrier;}});
+  try{
+    assert.equal(h.shadow.querySelector('#body').hidden,true);
+    h.shadow.querySelector('#summary').click();h.shadow.querySelector('#toggle').click();
+    assert.equal(h.shadow.querySelector('#body').hidden,true);
+    releaseRead();await tick();
+    assert.equal(h.shadow.querySelector('#body').hidden,true);
+  }finally{releaseRead();releaseWrites();}
+  await tick();assert.equal(h.storage.fabHelperPanel_v1.expanded,false);
 });

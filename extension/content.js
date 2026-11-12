@@ -34,9 +34,9 @@
     @media(max-width:430px){.body{padding:2px 12px 14px}.bar{gap:5px}.stat{padding:8px}.num{font-size:19px}}
   </style><section class="shell" aria-label="Fab 免费素材助手">
     <header class="bar"><span class="grip" title="拖动悬浮面板" aria-hidden="true">⠿</span><span class="dot"></span>
-    <button class="summary" id="summary" aria-expanded="true" aria-controls="body">Fab 免费素材助手</button>
-    <span class="count" id="counter">0/0</span><button class="icon" id="toggle" aria-label="收起面板" aria-expanded="true" aria-controls="body">⌃</button></header>
-    <div class="body" id="body"><div class="heading"><h1>免费素材，一键入库</h1><span class="badge">FAB</span></div>
+    <button class="summary" id="summary" aria-expanded="false" aria-controls="body">Fab 免费素材助手</button>
+    <span class="count" id="counter">0/0</span><button class="icon" id="toggle" aria-label="展开面板" aria-expanded="false" aria-controls="body">⌄</button></header>
+    <div class="body" id="body" hidden><div class="heading"><h1>免费素材，一键入库</h1><span class="badge">FAB</span></div>
     <div class="stats"><div class="stat"><div class="num green" id="claimed">0</div><div class="label">本轮新增</div></div><div class="stat"><div class="num" id="owned">0</div><div class="label" title="本页已确认拥有，包含本轮新增；同一素材编号只计一次">已拥有总计</div></div><div class="stat"><div class="num" id="skipped">0</div><div class="label">已跳过</div></div><div class="stat"><div class="num amber" id="failed">0</div><div class="label">失败</div></div></div>
     <div class="track" role="progressbar" aria-label="入库进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="fill"></div></div>
     <p class="message" id="message" role="status" aria-live="polite">正在扫描当前网页…</p>
@@ -50,12 +50,13 @@
     <div class="actions"><button class="btn primary" id="start">开始入库</button><button class="btn stop" id="pause" disabled>暂停</button><button class="btn" id="scan">重新扫描</button></div>
     <div class="list-head"><span id="memory">本地进度：开始后自动保存已确认项目</span><button class="link-btn" id="clear-memory" disabled>清除本地记录</button></div>
     <div class="list-head"><span id="found">当前网页 · 0 项</span><span><button class="link-btn" id="retry" disabled>重试失败</button>　<button class="link-btn" id="export" disabled>导出结果 ↗</button></span></div>
-    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.7</span></div>
+    <div class="list" id="list"></div><div class="footer"><span>仅领取已核对的零元授权</span><span translate="no" class="notranslate" lang="zh-CN">作者：菊山 · v1.5.8</span></div>
     </div></section>`;
   document.documentElement.append(host);
   const $ = selector => ui.querySelector(selector);
   const items = new Map();
-  let running = false, stopRequested = false, expanded = true, routeDirty = false, haltReason = null;
+  let running = false, stopRequested = false, expanded = false, routeDirty = false, haltReason = null;
+  let panelTouched = false;
   let route = location.pathname + location.search, message = '', error = false;
   const progressPrefix = 'fabHelperOwned_v1_';
   let progressAccount = null, progressReady = false, progressNotice = '', runCsrf = '';
@@ -281,12 +282,17 @@
     else if (added || changed) render();
     return added;
   }
-  function open(value) {
-    expanded = value;
+  function open(value, remember = true) {
+    expanded = value === true;
+    if (remember) panelTouched = true;
     $('#body').hidden = !expanded;
     $('#toggle').textContent = expanded ? '⌃' : '⌄';
     $('#toggle').setAttribute('aria-label', expanded ? '收起面板' : '展开面板');
     for (const el of [$('#toggle'), $('#summary')]) el.setAttribute('aria-expanded', String(expanded));
+    if (remember) {
+      try { Promise.resolve(chrome.storage.local.set({ fabHelperPanel_v1: { version: 1, expanded } })).catch(() => {}); }
+      catch { /* Keep the in-page choice even if this extension context is unavailable. */ }
+    }
   }
   const shouldStop = () => stopRequested || location.pathname + location.search !== route || !chrome.runtime.id || (running && runCsrf !== csrf());
   async function waitInterruptibly(ms) {
@@ -496,6 +502,9 @@
   $('#summary').addEventListener('click', () => open(!expanded));
   $('#toggle').addEventListener('click', () => open(!expanded));
   ui.addEventListener('keydown', e => { if (e.key === 'Escape') open(false); });
+  chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+    if (msg?.type === 'FAB_HELPER_OPEN') { open(true); respond({ ok: true }); }
+  });
   $('#scan').addEventListener('click', () => catalogMode() ? restartCatalog() : discover(true));
   $('#start').addEventListener('click', () => run());
   $('#pause').addEventListener('click', () => { stopRequested = true; setMessage('正在暂停，等待已提交项目的状态核对完成…'); });
@@ -545,10 +554,12 @@
     }
   } catch { /* Defaults work even if local settings are unavailable. */ }
   requestGate.interval = Number($('#rate').value);
+  try {
+    const { fabHelperPanel_v1: panel } = await chrome.storage.local.get('fabHelperPanel_v1');
+    // A late read must never override a click or toolbar action made during initialization.
+    if (!panelTouched) open(panel?.version === 1 && panel.expanded === true, false);
+  } catch { /* Start collapsed when the preference cannot be read. */ }
   await clearLegacyCooldown();
-  chrome.runtime.onMessage.addListener((msg, sender, respond) => {
-    if (msg?.type === 'FAB_HELPER_OPEN') { open(true); respond({ ok: true }); }
-  });
   // Drag only the handle, preserving normal keyboard/click behavior on controls.
   $('.grip').addEventListener('pointerdown', e => {
     if (e.button !== 0) return;
