@@ -6,6 +6,10 @@
 
 适合在 Quixel Megascans 卖家页、Fab 搜索结果或频道列表中领取免费素材。插件直接使用当前浏览器的 Fab 登录状态，无需 FabCLI，也无需安装 Node.js 才能使用。
 
+**直接安装：[下载 v1.5.8 精简安装包](https://github.com/xiaoranliu742-crypto/fab-library-helper/raw/refs/heads/main/downloads/fab-library-helper-v1.5.8.zip)**
+
+将安装包**解压到一个单独文件夹**，在浏览器点击“加载解压缩的扩展”，选择这个文件夹。里面应直接看到 `manifest.json`，不用再进入 `extension` 子目录。请勿直接选择 ZIP 文件。
+
 ## 功能
 
 - 支持中文、英文页面，包括 `Free`、`From Free` 和中文免费标记。
@@ -27,7 +31,27 @@
 
 ## 安装：Edge / Chrome
 
-### 1. 获取并解压项目
+### 1. 下载并解压（推荐精简安装包）
+
+点击上面的 **精简安装包** 下载链接，右键选择“全部解压”，保留默认解压到独立文件夹。解压后目录直接是：
+
+```text
+fab-library-helper-v1.5.8/
+├─ manifest.json
+├─ core.js
+├─ content.js
+├─ popup.html
+├─ popup.js
+├─ 安装说明.txt
+├─ README.md
+├─ PRIVACY.md
+└─ LICENSE
+```
+
+**加载时选这个直接包含 `manifest.json` 的文件夹。** 不需要编译、安装 Node.js 或复制单个文件。
+
+<details>
+<summary>如果下载的是 Code → Download ZIP 源码包，点这里看目录区别</summary>
 
 在 GitHub 仓库页面点击 **Code → Download ZIP**，将压缩包完整解压。
 
@@ -48,14 +72,18 @@ fab-library-helper-main/
 
 **安装时要选择包含 `manifest.json` 的 `extension` 文件夹。** 不需要双击 JS 文件、`manifest.json` 或 `popup.html`。
 
-如果拿到的是精简插件包，解压后直接看 `manifest.json` 位于哪个文件夹，选择那个文件夹即可。
+源码包和精简安装包的层级不同：源码包要选 `extension`，精简安装包直接选解压出来的文件夹。
+
+</details>
 
 ### 2. 打开浏览器扩展管理页
 
 - Edge：在地址栏输入 `edge://extensions`，回车。
 - Chrome：在地址栏输入 `chrome://extensions`，回车。
 
-打开页面上的 **开发人员模式**，点击 **加载解压缩的扩展**，选择上一步的 `extension` 文件夹。
+打开页面上的 **开发人员模式**，点击 **加载解压缩的扩展**，选择上一步直接包含 `manifest.json` 的文件夹。精简安装包选解压目录；源码包选其中的 `extension`。
+
+**出现“清单文件丢失或不可读取”？** 先取消加载，打开所选文件夹检查。看不到 `manifest.json` 就是选错层级：源码包通常需要再进入 `extension`；安装包则需先完整解压。不要把 `manifest.json` 单独移出来，脚本、页面等文件需要保持在同一目录。
 
 安装成功后，扩展卡片显示 **Fab 免费素材助手**，版本为 **1.5.8**，详细信息中的作者为 **菊山**。面板和弹窗使用固定中文署名并标记为不自动翻译。请保留安装文件夹；以后移动或删除它可能导致扩展无法加载。
 

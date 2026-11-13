@@ -1,5 +1,6 @@
 node_modules/
 *.zip
+!downloads/fab-library-helper-v*.zip
 test-results/
 .env
 .env.*

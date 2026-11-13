@@ -13,6 +13,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "package": "node scripts/package-extension.cjs",
     "test": "node --test tests/*.test.cjs"
   },
   "devDependencies": {
